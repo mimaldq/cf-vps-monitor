@@ -1,62 +1,62 @@
 #!/bin/bash
 
 # cf-vps-monitor - Cloudflare Worker VPS监控脚本
-# 版本: 2.1.0 - 修复参数解析问题
-# 支持FreeBSD、Linux、macOS
+# 版本: 1.1.0
+# 支持所有常见Linux系统，无需root权限
 
 set -euo pipefail
 
-# 初始化系统类型变量
-OS=$(uname -s)
-export OS
+# ==================== 常量定义 ====================
+declare -r OS=$(uname -s)
+declare -r SCRIPT_DIR="$HOME/.cf-vps-monitor"
+declare -r CONFIG_FILE="$SCRIPT_DIR/config/config"
+declare -r LOG_FILE="$SCRIPT_DIR/logs/monitor.log"
+declare -r PID_FILE="$SCRIPT_DIR/run/monitor.pid"
+declare -r SERVICE_FILE="$SCRIPT_DIR/bin/vps-monitor-service.sh"
+declare -r INSTALL_MANIFEST="$SCRIPT_DIR/system/install.manifest"
+declare -r CACHE_DIR="$SCRIPT_DIR/cache"
+declare -r TMPDIR="$SCRIPT_DIR/tmp"
 
 # 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
-
-# 全局变量 - 集中式文件管理
-SCRIPT_DIR="$HOME/.cf-vps-monitor"
-CONFIG_FILE="$SCRIPT_DIR/config/config"
-LOG_FILE="$SCRIPT_DIR/logs/monitor.log"
-PID_FILE="$SCRIPT_DIR/run/monitor.pid"
-SERVICE_FILE="$SCRIPT_DIR/bin/vps-monitor-service.sh"
-INSTALL_MANIFEST="$SCRIPT_DIR/system/install.manifest"
+declare -r RED='\033[0;31m'
+declare -r GREEN='\033[0;32m'
+declare -r YELLOW='\033[1;33m'
+declare -r BLUE='\033[0;34m'
+declare -r PURPLE='\033[0;35m'
+declare -r CYAN='\033[0;36m'
+declare -r NC='\033[0m'
 
 # 默认配置
-DEFAULT_INTERVAL=10
-DEFAULT_WORKER_URL=""
-DEFAULT_SERVER_ID=""
-DEFAULT_API_KEY=""
+declare -r DEFAULT_INTERVAL=10
+declare -r DEFAULT_WORKER_URL=""
+declare -r DEFAULT_SERVER_ID=""
+declare -r DEFAULT_API_KEY=""
+
+# 全局变量
+declare WORKER_URL="$DEFAULT_WORKER_URL"
+declare SERVER_ID="$DEFAULT_SERVER_ID"
+declare API_KEY="$DEFAULT_API_KEY"
+declare INTERVAL="$DEFAULT_INTERVAL"
+
+# ==================== 工具函数 ====================
 
 # 打印带颜色的消息
 print_message() {
-    local color=$1
-    local message=$2
-    echo -e "${color}${message}${NC}"
+    echo -e "${1}${2}${NC}"
 }
 
 # 日志函数
 log() {
-    local message="$1"
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] $message" >> "$LOG_FILE"
-
-    # 只在非服务模式下输出到控制台
-    if [[ "${SERVICE_MODE:-false}" != "true" ]]; then
-        echo "[$timestamp] $message"
-    fi
+    echo "[$timestamp] $1" >> "$LOG_FILE"
+    
+    [[ "${SERVICE_MODE:-false}" != "true" ]] && echo "[$timestamp] $1"
 }
 
 # 错误处理
 error_exit() {
-    local message="$1"
-    print_message "$RED" "错误: $message"
-    log "ERROR: $message"
+    print_message "$RED" "错误: $1"
+    log "ERROR: $1"
     exit 1
 }
 
@@ -65,138 +65,104 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# 检测系统信息
+# 安全的整数验证
+sanitize_integer() {
+    local value="${1//[^0-9]/}"
+    [[ -n "$value" && "$value" =~ ^[0-9]+$ ]] && echo "$value" || echo "${2:-0}"
+}
+
+# 安全的数字验证
+sanitize_number() {
+    local value="${1//[^0-9.]/}"
+    [[ "$value" =~ ^[0-9]*\.?[0-9]+$ ]] && echo "$value" || echo "${2:-0}"
+}
+
+# 清理JSON字符串
+clean_json_string() {
+    tr -d '\000-\037\177-\377' <<< "$1"
+}
+
+# ==================== 系统检测函数 ====================
+
+# 检测是否为root用户
+is_root_user() {
+    [[ $EUID -eq 0 ]]
+}
+
+# 检测系统类型
 detect_system() {
     local system_info=$(uname -srm)
-    IFS=' ' read -r OS KERNEL_VERSION ARCH <<< "$system_info"
-
-    if [[ "$OS" == "FreeBSD" ]]; then
-        VER=$(echo "$KERNEL_VERSION" | cut -d'-' -f1)
-        DISTRO_ID="freebsd"
-        DISTRO_NAME="FreeBSD"
-        print_message "$GREEN" "检测到系统: FreeBSD $VER"
-    elif [[ "$OS" == "Darwin" ]]; then
-        VER=$(sw_vers -productVersion 2>/dev/null || echo "$KERNEL_VERSION")
-        DISTRO_ID="macos"
-        DISTRO_NAME="macOS"
-        print_message "$GREEN" "检测到系统: macOS $VER"
-    else
-        # Linux系统
-        if [[ -f /etc/os-release ]]; then
-            local os_info=$(cat /etc/os-release 2>/dev/null)
-            DISTRO_ID=$(echo "$os_info" | grep '^ID=' | cut -d= -f2 | tr -d '"' || echo "linux")
-            VER=$(echo "$os_info" | grep '^VERSION_ID=' | cut -d= -f2 | tr -d '"' || echo "unknown")
-            DISTRO_NAME=$(echo "$os_info" | grep '^NAME=' | cut -d= -f2 | tr -d '"' || echo "Linux")
-        else
-            DISTRO_ID="linux"
-            VER="unknown"
-            DISTRO_NAME="Linux"
-        fi
-        print_message "$GREEN" "检测到系统: $DISTRO_NAME $VER"
-    fi
-
-    export OS ARCH KERNEL_VERSION VER DISTRO_ID DISTRO_NAME
+    IFS=' ' read -r OS ARCH KERNEL_VERSION <<< "$system_info"
+    
+    case "$OS" in
+        FreeBSD)
+            VER=$(echo "$KERNEL_VERSION" | cut -d'-' -f1)
+            DISTRO_ID="freebsd"
+            DISTRO_NAME="FreeBSD"
+            ;;
+        Darwin)
+            VER=$(sw_vers -productVersion 2>/dev/null || echo "$KERNEL_VERSION")
+            DISTRO_ID="macos"
+            DISTRO_NAME="macOS"
+            ;;
+        *)
+            if [[ -f /etc/os-release ]]; then
+                local os_info=$(cat /etc/os-release)
+                DISTRO_ID=$(grep '^ID=' <<< "$os_info" | cut -d= -f2 | tr -d '"')
+                VER=$(grep '^VERSION_ID=' <<< "$os_info" | cut -d= -f2 | tr -d '"')
+                DISTRO_NAME=$(grep '^NAME=' <<< "$os_info" | cut -d= -f2 | tr -d '"')
+            else
+                DISTRO_ID="linux"
+                VER="unknown"
+                DISTRO_NAME="Linux"
+            fi
+            ;;
+    esac
+    
+    print_message "$GREEN" "检测到系统: $DISTRO_NAME $VER"
 }
 
-# 安装依赖
-install_dependencies() {
-    print_message "$BLUE" "检查系统依赖..."
-    
-    local missing_deps=()
-    
-    if ! command_exists curl; then
-        missing_deps+=("curl")
-    fi
-    
-    if ! command_exists bc; then
-        missing_deps+=("bc")
-    fi
-    
-    if [[ ${#missing_deps[@]} -eq 0 ]]; then
-        print_message "$GREEN" "所有必需依赖已安装"
-        return 0
-    fi
-
-    print_message "$YELLOW" "缺少必需依赖: ${missing_deps[*]}"
-    
-    # FreeBSD系统
-    if [[ "$OS" == "FreeBSD" ]]; then
-        if command_exists pkg; then
-            print_message "$BLUE" "使用pkg安装依赖..."
-            sudo pkg install -y curl bc 2>/dev/null || {
-                print_message "$YELLOW" "需要root权限安装依赖，请手动执行:"
-                print_message "$CYAN" "  sudo pkg install -y curl bc"
-            }
-        else
-            print_message "$YELLOW" "请手动安装依赖:"
-            print_message "$CYAN" "  pkg install curl bc"
-        fi
-    else
-        # Linux系统
-        if command_exists apt-get; then
-            print_message "$BLUE" "使用apt-get安装依赖..."
-            sudo apt-get update && sudo apt-get install -y curl bc 2>/dev/null || {
-                print_message "$YELLOW" "需要root权限安装依赖，请手动执行:"
-                print_message "$CYAN" "  sudo apt-get update && sudo apt-get install -y curl bc"
-            }
-        elif command_exists yum; then
-            print_message "$BLUE" "使用yum安装依赖..."
-            sudo yum install -y curl bc 2>/dev/null || {
-                print_message "$YELLOW" "需要root权限安装依赖，请手动执行:"
-                print_message "$CYAN" "  sudo yum install -y curl bc"
-            }
-        elif command_exists dnf; then
-            print_message "$BLUE" "使用dnf安装依赖..."
-            sudo dnf install -y curl bc 2>/dev/null || {
-                print_message "$YELLOW" "需要root权限安装依赖，请手动执行:"
-                print_message "$CYAN" "  sudo dnf install -y curl bc"
-            }
-        else
-            print_message "$YELLOW" "未检测到包管理器，请手动安装依赖"
-            print_message "$CYAN" "常见安装命令:"
-            print_message "$CYAN" "  Ubuntu/Debian: sudo apt-get install curl bc"
-            print_message "$CYAN" "  CentOS/RHEL: sudo yum install curl bc"
-            print_message "$CYAN" "  Fedora: sudo dnf install curl bc"
-            print_message "$CYAN" "  Alpine: sudo apk add curl bc"
-        fi
-    fi
-    
-    # 重新检查
-    if ! command_exists curl && ! command_exists wget; then
-        print_message "$RED" "错误: curl和wget都不可用"
-        return 1
-    fi
-    
-    print_message "$GREEN" "依赖检查完成"
-}
+# ==================== 目录管理函数 ====================
 
 # 创建目录结构
 create_directories() {
     print_message "$BLUE" "创建集中式目录结构..."
-    mkdir -p "$SCRIPT_DIR"/{bin,config,logs,tmp,cache,run,system/{templates,backups}} || error_exit "无法创建目录结构"
+    
+    local dirs=(
+        "$SCRIPT_DIR/bin"
+        "$SCRIPT_DIR/config" 
+        "$SCRIPT_DIR/logs"
+        "$SCRIPT_DIR/tmp"
+        "$SCRIPT_DIR/cache"
+        "$SCRIPT_DIR/run"
+        "$SCRIPT_DIR/system/templates"
+        "$SCRIPT_DIR/system/backups"
+    )
+    
+    for dir in "${dirs[@]}"; do
+        mkdir -p "$dir" 2>/dev/null || true
+    done
+    
     touch "$INSTALL_MANIFEST"
-    export TMPDIR="$SCRIPT_DIR/tmp"
-    print_message "$GREEN" "✓ 集中式目录结构创建完成"
+    print_message "$GREEN" "✓ 目录结构创建完成"
 }
+
+# ==================== 配置管理函数 ====================
 
 # 加载配置
 load_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
         source "$CONFIG_FILE"
     else
-        WORKER_URL=$(echo "$DEFAULT_WORKER_URL" | tr -d ' \n\r')
-        SERVER_ID=$(echo "$DEFAULT_SERVER_ID" | tr -d ' \n\r')
-        API_KEY=$(echo "$DEFAULT_API_KEY" | tr -d ' \n\r')
+        WORKER_URL="$DEFAULT_WORKER_URL"
+        SERVER_ID="$DEFAULT_SERVER_ID"
+        API_KEY="$DEFAULT_API_KEY"
         INTERVAL="$DEFAULT_INTERVAL"
     fi
 }
 
 # 保存配置
 save_config() {
-    WORKER_URL=$(echo "$WORKER_URL" | tr -d ' \n\r')
-    SERVER_ID=$(echo "$SERVER_ID" | tr -d ' \n\r')
-    API_KEY=$(echo "$API_KEY" | tr -d ' \n\r')
-    
     cat > "$CONFIG_FILE" << EOF
 # VPS监控配置文件
 WORKER_URL="$WORKER_URL"
@@ -204,167 +170,182 @@ SERVER_ID="$SERVER_ID"
 API_KEY="$API_KEY"
 INTERVAL="$INTERVAL"
 EOF
-    print_message "$GREEN" "配置已保存到 $CONFIG_FILE"
+    print_message "$GREEN" "配置已保存"
 }
 
-# 创建服务脚本
-create_service_script() {
-    # 获取当前脚本的绝对路径
-    local main_script_path=$(realpath "$0" 2>/dev/null || echo "$0")
-    
-    cat > "$SERVICE_FILE" << 'EOF'
-#!/bin/bash
-
-# cf-vps-monitor服务脚本 - 集中式文件管理
-SCRIPT_DIR="$HOME/.cf-vps-monitor"
-CONFIG_FILE="$SCRIPT_DIR/config/config"
-LOG_FILE="$SCRIPT_DIR/logs/monitor.log"
-PID_FILE="$SCRIPT_DIR/run/monitor.pid"
-
-# 设置服务模式标志
-export SERVICE_MODE=true
-
-# 确保日志目录存在
-mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
-
-# 日志函数
-log() {
-    local message="$1"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] $message" >> "$LOG_FILE"
-}
-
-# 加载配置
-if [[ -f "$CONFIG_FILE" ]]; then
-    source "$CONFIG_FILE"
-else
-    log "错误: 配置文件不存在: $CONFIG_FILE"
-    exit 1
-fi
+# ==================== 系统监控函数 ====================
 
 # 获取CPU使用率
 get_cpu_usage() {
-    local cpu_usage=0
-    if [[ -f /proc/stat ]]; then
-        local cpu_line=$(head -n1 /proc/stat 2>/dev/null)
-        if [[ -n "$cpu_line" ]]; then
+    local cpu_usage=0 load_avg="0,0,0"
+    
+    if [[ "$OS" == "FreeBSD" ]]; then
+        # FreeBSD CPU使用率
+        if command_exists sysctl; then
+            local cpu_idle cpu_total
+            cpu_idle=$(sysctl -n kern.cp_time 2>/dev/null | awk '{print $5}')
+            cpu_total=$(sysctl -n kern.cp_time 2>/dev/null | awk '{sum=0; for(i=1;i<=NF;i++) sum+=$i; print sum}')
+            
+            cpu_idle=$(sanitize_integer "$cpu_idle")
+            cpu_total=$(sanitize_integer "$cpu_total")
+            
+            if [[ $cpu_total -gt 0 ]]; then
+                cpu_usage=$(echo "scale=1; 100 - ($cpu_idle * 100 / $cpu_total)" | bc 2>/dev/null || echo "0")
+            fi
+        fi
+        
+        # FreeBSD负载
+        if command_exists sysctl; then
+            load_avg=$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2","$3","$4}')
+        fi
+    else
+        # Linux CPU使用率
+        if [[ -f /proc/stat ]]; then
+            local cpu_line=$(head -n1 /proc/stat)
             local cpu_times=($cpu_line)
+            
             if [[ ${#cpu_times[@]} -ge 8 ]]; then
                 local idle=${cpu_times[4]}
                 local iowait=${cpu_times[5]:-0}
                 local total=0
+                
                 for i in {1..7}; do
-                    if [[ -n "${cpu_times[i]}" && "${cpu_times[i]}" =~ ^[0-9]+$ ]]; then
-                        total=$((total + cpu_times[i]))
-                    fi
+                    [[ -n "${cpu_times[i]}" && "${cpu_times[i]}" =~ ^[0-9]+$ ]] && total=$((total + cpu_times[i]))
                 done
-                if [[ $total -gt 0 ]]; then
-                    cpu_usage=$(echo "scale=1; 100 - (($idle + $iowait) * 100 / $total)" | bc 2>/dev/null || echo "0")
+                
+                [[ $total -gt 0 ]] && cpu_usage=$(echo "scale=1; 100 - (($idle + $iowait) * 100 / $total)" | bc 2>/dev/null || echo "0")
+            fi
+        fi
+        
+        # Linux负载
+        if [[ -f /proc/loadavg ]]; then
+            load_avg=$(awk '{print $1","$2","$3}' /proc/loadavg 2>/dev/null || echo "0,0,0")
+        fi
+    fi
+    
+    cpu_usage=$(sanitize_number "$cpu_usage")
+    echo "{\"usage_percent\":$cpu_usage,\"load_avg\":[$load_avg]}"
+}
+
+# 获取内存使用情况
+get_memory_usage() {
+    local total=0 used=0 free=0 usage_percent=0
+    
+    if [[ "$OS" == "FreeBSD" ]]; then
+        # FreeBSD内存
+        if command_exists sysctl; then
+            local page_size=$(sysctl -n hw.pagesize 2>/dev/null || echo "4096")
+            local total_pages=$(sysctl -n vm.stats.vm.v_page_count 2>/dev/null || echo "0")
+            local free_pages=$(sysctl -n vm.stats.vm.v_free_count 2>/dev/null || echo "0")
+            local inactive_pages=$(sysctl -n vm.stats.vm.v_inactive_count 2>/dev/null || echo "0")
+            local cache_pages=$(sysctl -n vm.stats.vm.v_cache_count 2>/dev/null || echo "0")
+            
+            page_size=$(sanitize_integer "$page_size" "4096")
+            total_pages=$(sanitize_integer "$total_pages")
+            free_pages=$(sanitize_integer "$free_pages")
+            inactive_pages=$(sanitize_integer "$inactive_pages")
+            cache_pages=$(sanitize_integer "$cache_pages")
+            
+            if [[ $page_size -gt 0 && $total_pages -gt 0 ]]; then
+                total=$(( (total_pages * page_size) / 1024 ))
+                free=$(( ((free_pages + inactive_pages + cache_pages) * page_size) / 1024 ))
+                used=$((total - free))
+                [[ $used -lt 0 ]] && used=0
+                [[ $free -lt 0 ]] && free=0
+            fi
+        fi
+    else
+        # Linux内存
+        if command_exists free; then
+            local mem_info=$(free -k 2>/dev/null | grep "^Mem:")
+            if [[ -n "$mem_info" ]]; then
+                total=$(awk '{print $2}' <<< "$mem_info")
+                local available=$(awk '{print $7}' <<< "$mem_info" 2>/dev/null || echo "")
+                
+                if [[ "$available" =~ ^[0-9]+$ ]]; then
+                    free=$available
+                    used=$((total - free))
+                else
+                    local mem_free=$(awk '{print $4}' <<< "$mem_info" 2>/dev/null || echo "0")
+                    local buff_cache=$(awk '{print $6}' <<< "$mem_info" 2>/dev/null || echo "0")
+                    
+                    if [[ "$mem_free" =~ ^[0-9]+$ ]] && [[ "$buff_cache" =~ ^[0-9]+$ ]]; then
+                        free=$((mem_free + buff_cache))
+                        used=$((total - free))
+                    fi
                 fi
             fi
         fi
     fi
-    echo "$cpu_usage"
+    
+    total=$(sanitize_integer "$total")
+    used=$(sanitize_integer "$used")
+    free=$(sanitize_integer "$free")
+    
+    [[ $total -gt 0 ]] && usage_percent=$(echo "scale=1; $used * 100 / $total" | bc 2>/dev/null || echo "0")
+    
+    echo "{\"total\":$total,\"used\":$used,\"free\":$free,\"usage_percent\":$usage_percent}"
 }
 
-# 获取内存使用率
-get_memory_usage() {
-    local mem_usage=0
-    if [[ -f /proc/meminfo ]]; then
-        local mem_total=$(grep "^MemTotal:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
-        local mem_free=$(grep "^MemFree:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
-        local buffers=$(grep "^Buffers:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
-        local cached=$(grep "^Cached:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
-        
-        if [[ $mem_total -gt 0 ]]; then
-            local mem_used=$((mem_total - mem_free - buffers - cached))
-            mem_usage=$(echo "scale=1; $mem_used * 100 / $mem_total" | bc 2>/dev/null || echo "0")
-        fi
-    fi
-    echo "$mem_usage"
+# ==================== 服务管理函数 ====================
+
+# 验证PID有效性
+validate_pid() {
+    local pid="$1"
+    [[ "$pid" =~ ^[0-9]+$ ]] && [[ "$pid" != "$$" ]] && kill -0 "$pid" 2>/dev/null
 }
 
-# 获取磁盘使用率
-get_disk_usage() {
-    local disk_usage=0
-    if command -v df >/dev/null 2>&1; then
-        disk_usage=$(df / --output=pcent 2>/dev/null | tail -1 | tr -d '% ' || echo "0")
-    fi
-    echo "$disk_usage"
-}
-
-# 上报数据
-report_metrics() {
-    local cpu_usage=$(get_cpu_usage)
-    local mem_usage=$(get_memory_usage)
-    local disk_usage=$(get_disk_usage)
-    local uptime=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo "0")
-    local timestamp=$(date +%s)
+# 查找监控进程
+find_monitor_processes() {
+    local pids=""
     
-    local json_data="{\"timestamp\":$timestamp,\"server_id\":\"$SERVER_ID\",\"cpu_usage\":$cpu_usage,\"mem_usage\":$mem_usage,\"disk_usage\":$disk_usage,\"uptime\":$uptime}"
+    # 从PID文件获取
+    [[ -f "$PID_FILE" ]] && {
+        local file_pid=$(< "$PID_FILE")
+        validate_pid "$file_pid" && pids="$file_pid"
+    }
     
-    local clean_api_key=$(echo "$API_KEY" | tr -d ' \n\r')
-    local clean_server_id=$(echo "$SERVER_ID" | tr -d ' \n\r')
-    
-    local response=$(curl -s -w "%{http_code}" -X POST "$WORKER_URL/api/report/$clean_server_id" \
-        -H "Content-Type: application/json" \
-        -H "X-API-Key: $clean_api_key" \
-        -d "$json_data" 2>/dev/null || echo "000")
-    
-    local http_code="${response: -3}"
-    
-    if [[ "$http_code" == "200" ]]; then
-        log "数据上报成功"
-        return 0
-    else
-        log "数据上报失败 (HTTP $http_code)"
-        return 1
-    fi
-}
-
-# 主循环
-main() {
-    log "VPS监控服务启动 (PID: $$)"
-    echo $$ > "$PID_FILE"
-    
-    trap 'log "收到终止信号，正在停止..."; rm -f "$PID_FILE"; exit 0' TERM INT
-    
-    while true; do
-        if report_metrics; then
-            sleep "$INTERVAL"
+    # 从进程查找
+    [[ -z "$pids" && -f "$SERVICE_FILE" ]] && {
+        if [[ "$OS" == "FreeBSD" ]]; then
+            pids=$(ps axww | grep -F "$SERVICE_FILE" | grep -v grep | awk '{print $1}')
         else
-            sleep 30
+            pids=$(ps aux | grep -F "$SERVICE_FILE" | grep -v grep | awk '{print $2}')
         fi
+    }
+    
+    # 验证所有PID
+    local valid_pids=""
+    for pid in $pids; do
+        validate_pid "$pid" && {
+            local cmd=$(ps -p "$pid" -o cmd= 2>/dev/null || echo "unknown")
+            [[ "$cmd" =~ (vps-monitor-service|cf-vps-monitor) ]] && valid_pids="$valid_pids $pid"
+        }
     done
+    
+    echo "${valid_pids## }"
 }
 
-# 启动主函数
-main
-EOF
-
-    chmod +x "$SERVICE_FILE"
-    print_message "$GREEN" "监控服务脚本创建完成: $SERVICE_FILE"
+# 检查服务是否运行
+is_monitor_running() {
+    [[ -n $(find_monitor_processes) ]]
 }
 
-# 启动监控服务
+# 启动服务
 start_service() {
     print_message "$BLUE" "启动监控服务..."
     
-    # 检查是否已在运行
-    if [[ -f "$PID_FILE" ]]; then
-        local pid=$(cat "$PID_FILE" 2>/dev/null)
-        if [[ -n "$pid" && $pid -gt 0 ]] && kill -0 "$pid" 2>/dev/null; then
-            print_message "$YELLOW" "监控服务已在运行 (PID: $pid)"
-            return 0
-        fi
+    if is_monitor_running; then
+        local pids=$(find_monitor_processes)
+        local first_pid=$(awk '{print $1}' <<< "$pids")
+        print_message "$YELLOW" "监控服务已在运行 (PID: $first_pid)"
+        return 0
     fi
     
-    # 清理旧的PID文件
-    rm -f "$PID_FILE" 2>/dev/null
+    rm -f "$PID_FILE" 2>/dev/null || true
     
-    # 启动服务
     if [[ ! -f "$SERVICE_FILE" ]]; then
-        print_message "$RED" "服务脚本不存在: $SERVICE_FILE"
+        print_message "$RED" "✗ 服务脚本不存在"
         return 1
     fi
     
@@ -382,7 +363,6 @@ start_service() {
     sleep 2
     if kill -0 "$pid" 2>/dev/null; then
         print_message "$GREEN" "✓ 监控服务已启动 (PID: $pid)"
-        print_message "$CYAN" "日志文件: $LOG_FILE"
         return 0
     else
         print_message "$RED" "✗ 监控服务启动失败"
@@ -391,393 +371,121 @@ start_service() {
     fi
 }
 
-# 停止监控服务
+# 停止服务
 stop_service() {
     print_message "$BLUE" "停止监控服务..."
     
-    if [[ -f "$PID_FILE" ]]; then
-        local pid=$(cat "$PID_FILE" 2>/dev/null)
-        if [[ -n "$pid" && $pid -gt 0 ]]; then
-            print_message "$BLUE" "停止进程 (PID: $pid)"
-            
-            # 温和停止
-            kill "$pid" 2>/dev/null
-            sleep 2
-            
-            # 强制停止
-            if kill -0 "$pid" 2>/dev/null; then
-                kill -9 "$pid" 2>/dev/null
-                sleep 1
-            fi
-            
-            # 最终确认
-            if ! kill -0 "$pid" 2>/dev/null; then
-                print_message "$GREEN" "✓ 监控服务已停止"
-            else
-                print_message "$RED" "✗ 无法停止监控服务"
-            fi
-        fi
-        rm -f "$PID_FILE"
-    else
-        print_message "$YELLOW" "没有运行中的监控服务"
+    local pids=$(find_monitor_processes)
+    if [[ -n "$pids" ]]; then
+        local count=0
+        for pid in $pids; do
+            kill "$pid" 2>/dev/null && sleep 2 && {
+                if ! kill -0 "$pid" 2>/dev/null; then
+                    ((count++))
+                else
+                    kill -9 "$pid" 2>/dev/null && sleep 1 && ((count++))
+                fi
+            } || true
+        done
+        print_message "$GREEN" "✓ 已停止 $count 个监控进程"
     fi
+    
+    rm -f "$PID_FILE" 2>/dev/null || true
+    print_message "$GREEN" "✓ 监控服务已停止"
 }
 
-# 检查服务状态
-check_service_status() {
-    print_message "$BLUE" "检查监控服务状态..."
-    
-    if [[ -f "$PID_FILE" ]]; then
-        local pid=$(cat "$PID_FILE" 2>/dev/null)
-        if [[ -n "$pid" && $pid -gt 0 ]] && kill -0 "$pid" 2>/dev/null; then
-            print_message "$GREEN" "✓ 监控服务正在运行 (PID: $pid)"
-            return 0
-        else
-            print_message "$RED" "✗ 监控服务未运行 (PID文件存在但进程不存在)"
-            rm -f "$PID_FILE"
-            return 1
-        fi
-    else
-        print_message "$RED" "✗ 监控服务未运行"
-        return 1
-    fi
-}
-
-# 查看日志
-view_logs() {
-    if [[ ! -f "$LOG_FILE" ]]; then
-        print_message "$YELLOW" "日志文件不存在: $LOG_FILE"
-        return
-    fi
-
-    print_message "$BLUE" "显示最近50行日志:"
-    echo "----------------------------------------"
-    tail -n 50 "$LOG_FILE"
-    echo "----------------------------------------"
-    print_message "$CYAN" "日志文件位置: $LOG_FILE"
-}
-
-# 测试连接
-test_connection() {
-    print_message "$BLUE" "测试连接到监控服务器..."
-    load_config
-
-    if [[ -z "$WORKER_URL" || -z "$SERVER_ID" || -z "$API_KEY" ]]; then
-        print_message "$RED" "配置不完整，请先配置监控参数"
-        return 1
-    fi
-
-    # 测试API连接
-    local clean_api_key=$(echo "$API_KEY" | tr -d ' \n\r')
-    local clean_server_id=$(echo "$SERVER_ID" | tr -d ' \n\r')
-    
-    print_message "$BLUE" "测试连接到: $WORKER_URL"
-    local response=$(curl -s -w "%{http_code}" -X GET "$WORKER_URL/api/health" \
-        -H "X-API-Key: $clean_api_key" 2>/dev/null || echo "000")
-    
-    local http_code="${response: -3}"
-    
-    if [[ "$http_code" == "200" ]]; then
-        print_message "$GREEN" "✓ 连接测试成功"
-        return 0
-    else
-        print_message "$RED" "✗ 连接测试失败 (HTTP $http_code)"
-        return 1
-    fi
-}
+# ==================== 主函数 ====================
 
 # 配置监控参数
 configure_monitor() {
     print_message "$BLUE" "配置监控参数"
     echo
-
+    
     load_config
-
-    # Server ID
+    
     echo -n "请输入Server ID"
-    if [[ -n "$SERVER_ID" ]]; then
-        echo -n " (当前: $SERVER_ID)"
-    fi
+    [[ -n "$SERVER_ID" ]] && echo -n " (当前: $SERVER_ID)"
     echo -n ": "
-    read -r input_server_id
-    if [[ -n "$input_server_id" ]]; then
-        SERVER_ID="$input_server_id"
-    fi
-
-    # API Key
+    read -r input
+    [[ -n "$input" ]] && SERVER_ID="$input"
+    
     echo -n "请输入API Key"
-    if [[ -n "$API_KEY" ]]; then
-        echo -n " (当前: ${API_KEY:0:8}...)"
-    fi
+    [[ -n "$API_KEY" ]] && echo -n " (当前: ${API_KEY:0:8}...)"
     echo -n ": "
-    read -r input_api_key
-    if [[ -n "$input_api_key" ]]; then
-        API_KEY="$input_api_key"
-    fi
-
-    # Worker URL
+    read -r input
+    [[ -n "$input" ]] && API_KEY="$input"
+    
     echo -n "请输入Worker URL"
-    if [[ -n "$WORKER_URL" ]]; then
-        echo -n " (当前: $WORKER_URL)"
-    fi
+    [[ -n "$WORKER_URL" ]] && echo -n " (当前: $WORKER_URL)"
     echo -n ": "
-    read -r input_url
-    if [[ -n "$input_url" ]]; then
-        WORKER_URL="$input_url"
-    fi
-
-    # 设置默认上报间隔为10秒
-    if [[ -z "$INTERVAL" ]]; then
-        INTERVAL="10"
-    fi
-
-    # 验证配置
-    if [[ -z "$WORKER_URL" || -z "$SERVER_ID" || -z "$API_KEY" ]]; then
-        print_message "$RED" "配置不完整，请确保所有必需参数都已填写"
-        return 1
-    fi
-
-    # 保存配置
+    read -r input
+    [[ -n "$input" ]] && WORKER_URL="$input"
+    
+    [[ -z "$INTERVAL" ]] && INTERVAL="10"
+    
     save_config
     print_message "$GREEN" "配置保存成功"
-    
-    return 0
 }
 
 # 安装监控服务
 install_monitor() {
     print_message "$BLUE" "开始安装VPS监控服务..."
-    echo
-
-    # 检测系统
+    
     detect_system
-
-    # 安装依赖
-    install_dependencies
-
-    # 创建目录结构
     create_directories
-
-    # 配置监控参数
+    
     if ! configure_monitor; then
         error_exit "配置失败，安装中止"
     fi
-
-    # 创建服务脚本
+    
     create_service_script
-
-    # 启动服务
-    if start_service; then
-        print_message "$GREEN" "✓ VPS监控服务安装并启动成功"
-        echo
-        print_message "$CYAN" "安装信息:"
-        echo "  安装目录: $SCRIPT_DIR"
-        echo "  配置文件: $CONFIG_FILE"
-        echo "  日志文件: $LOG_FILE"
-        echo "  服务脚本: $SERVICE_FILE"
-        echo
-        print_message "$YELLOW" "提示: 使用 '$0 status' 检查服务状态"
-        print_message "$YELLOW" "提示: 使用 '$0 logs' 查看运行日志"
-    else
-        error_exit "服务启动失败"
-    fi
+    start_service
+    
+    print_message "$GREEN" "✓ VPS监控服务安装并启动成功"
 }
 
-# 卸载监控服务
-uninstall_monitor() {
-    print_message "$YELLOW" "警告: 这将删除VPS监控服务及其数据"
-    echo -n "确认卸载? (y/N): "
-    read -r confirm
-
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        print_message "$BLUE" "取消卸载"
-        return 0
-    fi
-
-    print_message "$BLUE" "开始卸载VPS监控服务..."
-
-    # 停止服务
-    stop_service
-
-    # 删除目录
-    if [[ -d "$SCRIPT_DIR" ]]; then
-        rm -rf "$SCRIPT_DIR"
-        print_message "$GREEN" "✓ VPS监控服务已卸载"
-    else
-        print_message "$YELLOW" "安装目录不存在"
-    fi
-}
-
-# 一键安装函数（修复版）
-one_click_install() {
-    local server_id=""
-    local api_key=""
-    local worker_url=""
-    
-    # 解析参数
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -s|--server-id)
-                server_id="$2"
-                shift 2
-                ;;
-            -k|--api-key|--key)
-                api_key="$2"
-                shift 2
-                ;;
-            -u|--worker-url|--url)
-                worker_url="$2"
-                shift 2
-                ;;
-            -i|--install)
-                # 忽略这个参数，它只是表示一键安装模式
-                shift
-                ;;
-            *)
-                print_message "$RED" "未知参数: $1"
-                return 1
-                ;;
-        esac
-    done
-
-    print_message "$BLUE" "开始一键安装VPS监控服务..."
-    echo
-
-    # 验证必需参数
-    if [[ -z "$server_id" || -z "$api_key" || -z "$worker_url" ]]; then
-        print_message "$RED" "错误: 缺少必需参数"
-        echo "必需参数:"
-        echo "  -s <服务器ID> 或 --server-id <服务器ID>"
-        echo "  -k <API密钥> 或 --key <API密钥>"
-        echo "  -u <Worker地址> 或 --url <Worker地址>"
-        return 1
-    fi
-
-    print_message "$CYAN" "安装参数:"
-    echo "  服务器ID: $server_id"
-    echo "  API密钥: ${api_key:0:8}..."
-    echo "  Worker地址: $worker_url"
-    echo "  上报间隔: 10秒 (运行后会自动从服务器获取最新配置)"
-    echo
-
-    # 检测系统
-    detect_system
-
-    # 安装依赖
-    install_dependencies || {
-        print_message "$YELLOW" "依赖安装失败，尝试继续..."
-    }
-
-    # 创建目录结构
-    create_directories
-
-    # 设置配置参数
-    WORKER_URL="$worker_url"
-    SERVER_ID="$server_id"
-    API_KEY="$api_key"
-    INTERVAL="10"
-
-    # 保存配置
-    save_config
-    print_message "$GREEN" "配置保存成功"
-
-    # 测试连接
-    print_message "$BLUE" "测试连接..."
-    local clean_api_key=$(echo "$api_key" | tr -d ' \n\r')
-    local clean_server_id=$(echo "$server_id" | tr -d ' \n\r')
-    
-    local response=$(curl -s -w "%{http_code}" -X GET "$worker_url/api/health" \
-        -H "X-API-Key: $clean_api_key" 2>/dev/null || echo "000")
-    
-    local http_code="${response: -3}"
-    
-    if [[ "$http_code" == "200" ]]; then
-        print_message "$GREEN" "✓ 连接测试成功"
-    else
-        print_message "$YELLOW" "⚠ 连接测试失败 (HTTP $http_code)，但将继续安装"
-    fi
-
-    # 创建服务脚本
-    create_service_script
-
-    # 启动服务
-    if start_service; then
-        print_message "$GREEN" "✓ VPS监控服务一键安装成功"
-        echo
-        print_message "$CYAN" "安装信息:"
-        echo "  安装目录: $SCRIPT_DIR"
-        echo "  配置文件: $CONFIG_FILE"
-        echo "  日志文件: $LOG_FILE"
-        echo "  服务脚本: $SERVICE_FILE"
-        echo
-        print_message "$YELLOW" "提示: 使用 '$0 status' 检查服务状态"
-        print_message "$YELLOW" "提示: 使用 '$0 logs' 查看运行日志"
-        return 0
-    else
-        print_message "$RED" "✗ 服务启动失败"
-        return 1
-    fi
-}
-
-# 显示帮助信息
+# 显示帮助
 show_help() {
-    echo "VPS监控脚本 v2.1.0"
-    echo
-    echo "用法: $0 [命令] [选项]"
-    echo
-    echo "基本命令:"
-    echo "  install     安装监控服务"
-    echo "  uninstall   卸载监控服务"
-    echo "  start       启动监控服务"
-    echo "  stop        停止监控服务"
-    echo "  restart     重启监控服务"
-    echo "  status      查看服务状态"
-    echo "  logs        查看运行日志"
-    echo "  config      配置监控参数"
-    echo "  test        测试连接"
-    echo "  help        显示此帮助信息"
-    echo
-    echo "一键安装 (推荐):"
-    echo "  $0 -i -s 服务器ID -k API密钥 -u Worker地址"
-    echo "  或"
-    echo "  $0 --install --server-id 服务器ID --key API密钥 --url Worker地址"
-    echo
-    echo "示例:"
-    echo "  $0 -i -s hr20js -k 9947e75553434750f9aad401f09b65b41ca76e5204faefa79abb451cb3795baf -u https://mycf-vps.brxrqimy.workers.dev"
-    echo "  $0 install              # 交互式安装"
-    echo "  $0 status               # 查看服务状态"
-    echo "  $0 logs                 # 查看日志"
-    echo
-    echo "支持的参数:"
-    echo "  -i, --install          一键安装模式"
-    echo "  -s, --server-id ID     服务器ID"
-    echo "  -k, --key KEY          API密钥"
-    echo "  -u, --url URL          Worker地址"
+    cat << EOF
+VPS监控脚本 v1.1.0
+
+用法: $0 [选项]
+
+基本选项:
+  install     安装监控服务
+  uninstall   卸载监控服务
+  start       启动监控服务
+  stop        停止监控服务
+  restart     重启监控服务
+  status      查看服务状态
+  config      配置监控参数
+  help        显示此帮助信息
+
+一键安装参数:
+  -i, --install           一键安装模式
+  -s, --server-id ID      服务器ID
+  -k, --api-key KEY       API密钥
+  -u, --worker-url URL    Worker地址
+
+示例:
+  $0 install              # 交互式安装
+  $0 status               # 查看服务状态
+  $0 logs                 # 查看日志
+
+注意: 上报间隔会自动从服务器获取，无需手动设置
+EOF
 }
 
-# 解析命令行参数
-parse_arguments() {
-    # 如果没有参数，显示帮助
-    if [[ $# -eq 0 ]]; then
+# 主函数
+main() {
+    [[ $# -eq 0 ]] && {
         show_help
-        return 0
-    fi
-
-    # 检查是否是一键安装参数
-    for arg in "$@"; do
-        if [[ "$arg" == "-i" || "$arg" == "--install" ]]; then
-            one_click_install "$@"
-            return $?
-        fi
-    done
-
-    # 处理基本命令
+        exit 0
+    }
+    
     case "$1" in
         install)
             install_monitor
-            ;;
-        uninstall)
-            uninstall_monitor
             ;;
         start)
             start_service
@@ -791,36 +499,29 @@ parse_arguments() {
             start_service
             ;;
         status)
-            check_service_status
-            ;;
-        logs)
-            view_logs
+            if is_monitor_running; then
+                local pids=$(find_monitor_processes)
+                print_message "$GREEN" "✓ 监控服务正在运行"
+                [[ -n "$pids" ]] && print_message "$CYAN" "  进程PID: $pids"
+            else
+                print_message "$RED" "✗ 监控服务未运行"
+            fi
             ;;
         config)
             configure_monitor
-            ;;
-        test)
-            test_connection
             ;;
         help|--help|-h)
             show_help
             ;;
         *)
-            print_message "$RED" "未知命令: $1"
-            echo
+            print_message "$RED" "未知选项: $1"
             show_help
             exit 1
             ;;
     esac
 }
 
-# 主函数
-main() {
-    # 首先解析命令行参数
-    parse_arguments "$@"
-}
-
-# 脚本入口点
+# 脚本入口
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     main "$@"
 fi
