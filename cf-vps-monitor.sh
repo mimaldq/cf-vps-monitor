@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # cf-vps-monitor - Cloudflare Worker VPS监控脚本
-# 版本: 2.2.0 (问题修复版)
+# 版本: 2.2.0 (FreeBSD修复版)
+# 完全兼容FreeBSD系统
 
 set -euo pipefail
 
@@ -54,34 +55,17 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# FreeBSD兼容的sed函数
-safe_sed() {
-    local pattern="$1"
-    local file="$2"
-    
-    if [[ "$OS" == "FreeBSD" ]] || [[ "$OS" == "Darwin" ]]; then
-        sed -i '' "$pattern" "$file" 2>/dev/null || return 1
-    else
-        sed -i "$pattern" "$file" 2>/dev/null || return 1
-    fi
-}
+# ==================== 一键安装函数 ====================
 
-# ==================== 主入口点 ====================
-
-# 解析命令行参数
-parse_args() {
-    local command=""
+# 一键安装主函数（直接从命令行参数执行）
+one_click_install() {
     local server_id=""
     local api_key=""
     local worker_url=""
-    local install_mode=false
     
+    # 解析参数
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -i|--install)
-                install_mode=true
-                shift
-                ;;
             -s|--server-id)
                 server_id="$2"
                 shift 2
@@ -94,37 +78,16 @@ parse_args() {
                 worker_url="$2"
                 shift 2
                 ;;
-            -h|--help)
-                show_help
-                exit 0
-                ;;
             *)
-                command="$1"
                 shift
-                break
                 ;;
         esac
     done
     
-    # 如果是一键安装模式
-    if [[ "$install_mode" == "true" ]]; then
-        if [[ -z "$server_id" || -z "$api_key" || -z "$worker_url" ]]; then
-            error_exit "一键安装需要所有参数: -s SERVER_ID -k API_KEY -u WORKER_URL"
-        fi
-        one_click_install "$server_id" "$api_key" "$worker_url"
-        exit $?  # 安装完成后退出
+    # 验证参数
+    if [[ -z "$server_id" || -z "$api_key" || -z "$worker_url" ]]; then
+        error_exit "一键安装需要所有参数: -s SERVER_ID -k API_KEY -u WORKER_URL"
     fi
-    
-    # 返回命令
-    echo "$command"
-}
-
-# ==================== 一键安装函数 ====================
-
-one_click_install() {
-    local server_id="$1"
-    local api_key="$2"
-    local worker_url="$3"
     
     print_msg "$CYAN" "========================================"
     print_msg "$CYAN" "      VPS监控服务一键安装"
@@ -171,9 +134,8 @@ one_click_install() {
         echo "  重启服务: $0 restart"
         echo
         print_msg "$GREEN" "✓ 监控服务已启动并开始上报数据"
-        return 0
     else
-        return 1
+        error_exit "服务启动失败"
     fi
 }
 
@@ -560,13 +522,10 @@ main() {
 main
 EOF
     
-    # 替换脚本目录路径
-    if [[ "$OS" == "FreeBSD" ]] || [[ "$OS" == "Darwin" ]]; then
-        # FreeBSD/MacOS使用不同的sed语法
-        sed -i '' "s|__SCRIPT_DIR__|$SCRIPT_DIR|g" "$SERVICE_FILE" 2>/dev/null
-    else
-        sed -i "s|__SCRIPT_DIR__|$SCRIPT_DIR|g" "$SERVICE_FILE"
-    fi
+    # 替换脚本目录路径 - 使用sed的兼容方法
+    local temp_file="$SERVICE_FILE.tmp"
+    sed "s|__SCRIPT_DIR__|$SCRIPT_DIR|g" "$SERVICE_FILE" > "$temp_file"
+    mv "$temp_file" "$SERVICE_FILE"
     
     chmod +x "$SERVICE_FILE"
     print_msg "$GREEN" "✓ 服务脚本创建完成"
@@ -694,11 +653,9 @@ run_rc_command "$1"
 RCFILE
     
     # 替换服务脚本路径
-    if [[ "$OS" == "FreeBSD" ]] || [[ "$OS" == "Darwin" ]]; then
-        sed -i '' "s|__SERVICE_SCRIPT__|$SERVICE_FILE|g" "$rc_file"
-    else
-        sed -i "s|__SERVICE_SCRIPT__|$SERVICE_FILE|g" "$rc_file"
-    fi
+    local temp_file="$rc_file.tmp"
+    sed "s|__SERVICE_SCRIPT__|$SERVICE_FILE|g" "$rc_file" > "$temp_file"
+    mv "$temp_file" "$rc_file"
     
     chmod +x "$rc_file"
     
@@ -957,15 +914,31 @@ EOF
 # ==================== 主函数 ====================
 
 main() {
-    # 如果没有参数，显示帮助
-    if [ $# -eq 0 ]; then
-        show_help
-        exit 0
-    fi
+    # 检查是否是一键安装模式
+    for arg in "$@"; do
+        if [[ "$arg" == "-i" ]] || [[ "$arg" == "--install" ]]; then
+            # 直接调用一键安装函数
+            one_click_install "$@"
+            exit 0
+        fi
+    done
     
-    # 解析参数并获取命令
-    local command
-    command=$(parse_args "$@")
+    # 如果不是一键安装，解析其他命令
+    local command=""
+    for arg in "$@"; do
+        case "$arg" in
+            start|stop|restart|status|logs|uninstall|help)
+                command="$arg"
+                break
+                ;;
+        esac
+    done
+    
+    # 如果没有命令，显示帮助
+    if [[ -z "$command" ]]; then
+        show_help
+        return
+    fi
     
     # 处理命令
     case "$command" in
@@ -987,7 +960,7 @@ main() {
         uninstall)
             uninstall_service
             ;;
-        help|"")
+        help)
             show_help
             ;;
         *)
