@@ -1,9 +1,8 @@
 #!/bin/bash
 
 # cf-vps-monitor - Cloudflare Worker VPS监控脚本
-# 版本: 1.2.0
+# 版本: 1.1.0
 # 支持所有常见Linux系统，无需root权限
-# 增强Docker容器环境支持
 
 set -euo pipefail
 
@@ -33,11 +32,6 @@ DEFAULT_INTERVAL=10
 DEFAULT_WORKER_URL=""
 DEFAULT_SERVER_ID=""
 DEFAULT_API_KEY=""
-
-# Docker容器环境标志（将在detect_system中设置）
-IS_DOCKER_CONTAINER="false"
-IS_CONTAINER="false"
-CONTAINER_TYPE="none"
 
 # 打印带颜色的消息
 print_message() {
@@ -71,146 +65,160 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# ==================== Docker容器环境检测增强 ====================
+# ==================== Docker环境检测 ====================
 
-# 增强的Docker容器检测
-detect_docker_environment() {
-    IS_DOCKER_CONTAINER="false"
-    IS_CONTAINER="false"
-    CONTAINER_TYPE="none"
+# 检测Docker环境
+detect_docker_env() {
+    local docker_detected=false
     
-    # 方法1: 检查/.dockerenv文件（最直接的Docker标志）
+    # 方法1: 检查/.dockerenv文件（最简单的方法）
     if [[ -f "/.dockerenv" ]]; then
-        IS_DOCKER_CONTAINER="true"
-        IS_CONTAINER="true"
+        docker_detected=true
+        CONTAINER_ENV="true"
         CONTAINER_TYPE="docker"
-        log "检测到Docker容器环境 (/.dockerenv)"
-        return 0
+        log "检测到Docker环境 (/.dockerenv)"
     fi
     
     # 方法2: 检查cgroup中的docker信息
-    if [[ -f "/proc/1/cgroup" ]]; then
-        local cgroup_content=$(cat /proc/1/cgroup 2>/dev/null || echo "")
-        if echo "$cgroup_content" | grep -q "docker" || echo "$cgroup_content" | grep -q "kubepods"; then
-            IS_DOCKER_CONTAINER="true"
-            IS_CONTAINER="true"
+    if [[ "$docker_detected" == "false" && -f "/proc/1/cgroup" ]]; then
+        if grep -q "docker\|lxc" /proc/1/cgroup 2>/dev/null; then
+            docker_detected=true
+            CONTAINER_ENV="true"
             CONTAINER_TYPE="docker"
-            log "检测到Docker容器环境 (cgroup)"
-            return 0
+            log "检测到Docker环境 (cgroup检测)"
         fi
     fi
     
-    # 方法3: 检查环境变量（Docker/Kubernetes常用变量）
-    if [[ -n "${DOCKER_CONTAINER:-}" ]] || [[ -n "${KUBERNETES_SERVICE_HOST:-}" ]] || 
-       [[ -n "${CONTAINER_NAME:-}" ]] || [[ -n "${CONTAINER_ID:-}" ]]; then
-        IS_DOCKER_CONTAINER="true"
-        IS_CONTAINER="true"
-        CONTAINER_TYPE="docker"
-        log "检测到Docker容器环境 (环境变量)"
+    # 方法3: 检查容器环境变量
+    if [[ "$docker_detected" == "false" ]]; then
+        if [[ -n "${container:-}" ]]; then
+            docker_detected=true
+            CONTAINER_ENV="true"
+            CONTAINER_TYPE="${container}"
+            log "检测到容器环境 (环境变量: ${container})"
+        fi
+    fi
+    
+    # 方法4: 检查Kubernetes环境
+    if [[ "$docker_detected" == "false" ]]; then
+        if [[ -n "${KUBERNETES_SERVICE_HOST:-}" ]]; then
+            docker_detected=true
+            CONTAINER_ENV="true"
+            CONTAINER_TYPE="kubernetes"
+            log "检测到Kubernetes环境"
+        fi
+    fi
+    
+    # 设置环境变量
+    if [[ "$docker_detected" == "true" ]]; then
+        export CONTAINER_ENV CONTAINER_TYPE
+        print_message "$GREEN" "检测到容器环境: ${CONTAINER_TYPE}"
         return 0
-    fi
-    
-    # 方法4: 检查进程名（容器中通常没有systemd）
-    if [[ ! -d "/run/systemd/system" ]] && [[ "$(ps -p 1 -o comm= 2>/dev/null)" != "systemd" ]]; then
-        # 进一步验证，避免误判
-        if [[ -f "/proc/self/status" ]] && grep -q "container" /proc/self/status 2>/dev/null; then
-            IS_DOCKER_CONTAINER="true"
-            IS_CONTAINER="true"
-            CONTAINER_TYPE="docker"
-            log "检测到Docker容器环境 (进程检测)"
-            return 0
-        fi
-    fi
-    
-    # 如果不是Docker容器，检查是否是其他容器类型
-    if [[ -f "/proc/1/cgroup" ]]; then
-        local cgroup_content=$(cat /proc/1/cgroup 2>/dev/null || echo "")
-        if echo "$cgroup_content" | grep -q "lxc" || echo "$cgroup_content" | grep -q "container"; then
-            IS_CONTAINER="true"
-            CONTAINER_TYPE="lxc"
-            log "检测到LXC容器环境"
-        fi
-    fi
-    
-    # 输出检测结果
-    if [[ "$IS_DOCKER_CONTAINER" == "true" ]]; then
-        print_message "$GREEN" "✓ 运行在Docker容器环境中"
-    elif [[ "$IS_CONTAINER" == "true" ]]; then
-        print_message "$GREEN" "✓ 运行在容器环境中 ($CONTAINER_TYPE)"
     else
-        print_message "$GREEN" "✓ 运行在物理机或虚拟机环境中"
+        CONTAINER_ENV="false"
+        CONTAINER_TYPE="none"
+        export CONTAINER_ENV CONTAINER_TYPE
+        return 1
     fi
-    
-    export IS_DOCKER_CONTAINER IS_CONTAINER CONTAINER_TYPE
 }
 
-# Docker容器环境特殊处理 - 获取内存限制
-get_docker_memory_limit() {
-    local total_mem_kb=0
-    local limit_file=""
+# ==================== JSON数据处理 ====================
+
+# 清理JSON特殊字符（安全版本）
+clean_json_string() {
+    local input="$1"
     
-    # 优先检测cgroup v2
-    if [[ -f "/sys/fs/cgroup/memory.max" ]]; then
-        limit_file="/sys/fs/cgroup/memory.max"
-        local max_raw=$(cat "$limit_file" 2>/dev/null)
-        if [[ "$max_raw" != "max" && "$max_raw" =~ ^[0-9]+$ ]]; then
-            total_mem_kb=$((max_raw / 1024))
-            log "使用cgroup v2内存限制: $total_mem_kb KB"
-        fi
+    if [[ -z "$input" ]]; then
+        echo ""
+        return
     fi
     
-    # 检测cgroup v1（如果v2没有找到限制）
-    if [[ $total_mem_kb -eq 0 && -f "/sys/fs/cgroup/memory/memory.limit_in_bytes" ]]; then
-        limit_file="/sys/fs/cgroup/memory/memory.limit_in_bytes"
-        local limit_raw=$(cat "$limit_file" 2>/dev/null || echo "0")
-        # 忽略极大的值（未限制的情况）
-        if [[ "$limit_raw" =~ ^[0-9]+$ && "$limit_raw" -lt 9223372036854771712 ]]; then
-            total_mem_kb=$((limit_raw / 1024))
-            log "使用cgroup v1内存限制: $total_mem_kb KB"
-        fi
-    fi
+    # 移除所有控制字符（ASCII 0-31，127）
+    input=$(echo "$input" | tr -d '\000-\031' | tr -d '\177')
     
-    echo "$total_mem_kb"
+    # 转义特殊JSON字符
+    input=$(echo "$input" | sed 's/\\/\\\\/g')  # 反斜杠
+    input=$(echo "$input" | sed 's/"/\\"/g')    # 双引号
+    input=$(echo "$input" | sed 's/\//\\\//g')  # 正斜杠
+    input=$(echo "$input" | sed 's/\x08/\\b/g') # 退格
+    input=$(echo "$input" | sed 's/\x0C/\\f/g') # 换页
+    input=$(echo "$input" | sed 's/\x0A/\\n/g') # 换行
+    input=$(echo "$input" | sed 's/\x0D/\\r/g') # 回车
+    input=$(echo "$input" | sed 's/\x09/\\t/g') # 制表符
+    
+    echo "$input"
 }
 
-# Docker容器环境特殊处理 - 获取CPU限制
-get_docker_cpu_limit() {
-    local cpu_count=0
+# 验证JSON格式
+validate_json() {
+    local json="$1"
     
-    # 方法1: 使用cgroup CPU配额
-    if [[ -f "/sys/fs/cgroup/cpu/cpu.cfs_quota_us" ]] && [[ -f "/sys/fs/cgroup/cpu/cpu.cfs_period_us" ]]; then
-        local cpu_quota=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null)
-        local cpu_period=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us 2>/dev/null)
-        
-        if [[ "$cpu_quota" != "-1" && "$cpu_quota" =~ ^[0-9]+$ && "$cpu_period" =~ ^[0-9]+$ && $cpu_period -gt 0 ]]; then
-            cpu_count=$((cpu_quota / cpu_period))
-            log "使用cgroup CPU配额: $cpu_count 核心"
-        fi
+    if [[ -z "$json" ]]; then
+        return 1
     fi
     
-    # 方法2: 使用cpuset（如果配额未设置）
-    if [[ $cpu_count -eq 0 && -f "/sys/fs/cgroup/cpuset/cpuset.cpus" ]]; then
-        local cpuset=$(cat /sys/fs/cgroup/cpuset/cpuset.cpus 2>/dev/null)
-        if [[ -n "$cpuset" ]]; then
-            # 简单解析cpuset格式，如"0-3"或"0,1,2,3"
-            if [[ "$cpuset" =~ ^[0-9]+-[0-9]+$ ]]; then
-                local start=${cpuset%-*}
-                local end=${cpuset#*-}
-                cpu_count=$((end - start + 1))
-            elif [[ "$cpuset" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
-                cpu_count=$(echo "$cpuset" | tr ',' '\n' | wc -l)
+    # 简单验证JSON结构（不依赖jq）
+    if [[ "$json" =~ ^\{.*\}$ ]]; then
+        # 检查是否有未闭合的引号
+        local quote_count=$(echo "$json" | tr -cd '"' | wc -c)
+        if [[ $((quote_count % 2)) -eq 0 ]]; then
+            # 检查是否有未转义的控制字符
+            if ! echo "$json" | grep -q $'[\x00-\x1F\x7F]'; then
+                return 0
             fi
-            log "使用cpuset CPU限制: $cpu_count 核心"
         fi
     fi
     
-    # 方法3: 回退到系统CPU核心数
-    if [[ $cpu_count -eq 0 ]]; then
-        cpu_count=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
-        log "使用系统CPU核心数: $cpu_count 核心"
+    return 1
+}
+
+# 构建安全的JSON数据
+build_safe_json() {
+    local timestamp="$1"
+    local cpu_raw="$2"
+    local memory_raw="$3"
+    local disk_raw="$4"
+    local network_raw="$5"
+    local uptime_raw="$6"
+    
+    # 清理所有输入数据
+    timestamp=$(sanitize_integer "$timestamp" "0")
+    uptime_raw=$(sanitize_integer "$uptime_raw" "0")
+    
+    # 验证各个JSON组件
+    if ! validate_json "$cpu_raw"; then
+        log "警告: CPU数据格式无效，使用默认值"
+        cpu_raw='{"usage_percent":0,"load_avg":[0,0,0]}'
     fi
     
-    echo "$cpu_count"
+    if ! validate_json "$memory_raw"; then
+        log "警告: 内存数据格式无效，使用默认值"
+        memory_raw='{"total":0,"used":0,"free":0,"usage_percent":0}'
+    fi
+    
+    if ! validate_json "$disk_raw"; then
+        log "警告: 磁盘数据格式无效，使用默认值"
+        disk_raw='{"total":0,"used":0,"free":0,"usage_percent":0}'
+    fi
+    
+    if ! validate_json "$network_raw"; then
+        log "警告: 网络数据格式无效，使用默认值"
+        network_raw='{"upload_speed":0,"download_speed":0,"total_upload":0,"total_download":0}'
+    fi
+    
+    # 构建最终JSON（直接构造，避免复杂处理）
+    local data="{\"timestamp\":$timestamp,\"cpu\":$cpu_raw,\"memory\":$memory_raw,\"disk\":$disk_raw,\"network\":$network_raw,\"uptime\":$uptime_raw,\"container\":{\"is_container\":${CONTAINER_ENV:-false},\"container_type\":\"${CONTAINER_TYPE:-none}\"}}"
+    
+    # 最终验证
+    if validate_json "$data"; then
+        echo "$data"
+        return 0
+    else
+        # 如果仍然无效，使用最简化的版本
+        log "错误: JSON构建失败，使用简化数据"
+        echo '{"timestamp":0,"cpu":{"usage_percent":0,"load_avg":[0,0,0]},"memory":{"total":0,"used":0,"free":0,"usage_percent":0},"disk":{"total":0,"used":0,"free":0,"usage_percent":0},"network":{"upload_speed":0,"download_speed":0,"total_upload":0,"total_download":0},"uptime":0,"container":{"is_container":false,"container_type":"none"}}'
+        return 1
+    fi
 }
 
 # ==================== 系统兼容性层 ====================
@@ -615,10 +623,10 @@ execute_system_command() {
     esac
 }
 
-# 检测系统信息（优化版 - 包含Docker检测）
+# 检测系统信息（优化版 - 减少fork操作）
 detect_system() {
-    # 首先检测Docker/容器环境
-    detect_docker_environment
+    # 检测Docker环境
+    detect_docker_env
     
     # 一次性获取系统基本信息（减少fork）
     local system_info=$(uname -srm)
@@ -626,17 +634,21 @@ detect_system() {
 
     # FreeBSD特殊优化（避免不必要的检测）
     if [[ "$OS" == "FreeBSD" ]]; then
+        VIRTUALIZATION="none"
         VER=$(echo "$KERNEL_VERSION" | cut -d'-' -f1)
         DISTRO_ID="freebsd"
         DISTRO_NAME="FreeBSD"
         print_message "$GREEN" "检测到系统: FreeBSD $VER"
     elif [[ "$OS" == "Darwin" ]]; then
+        VIRTUALIZATION="none"
         VER=$(sw_vers -productVersion 2>/dev/null || echo "$KERNEL_VERSION")
         DISTRO_ID="macos"
         DISTRO_NAME="macOS"
         print_message "$GREEN" "检测到系统: macOS $VER"
     else
         # Linux系统的简化检测
+        VIRTUALIZATION="none"
+
         # 简化的发行版检测
         if [[ -f /etc/os-release ]]; then
             local os_info=$(cat /etc/os-release 2>/dev/null)
@@ -650,32 +662,11 @@ detect_system() {
         fi
 
         print_message "$GREEN" "检测到系统: $DISTRO_NAME $VER"
-        
-        # 如果检测到Docker容器，额外显示信息
-        if [[ "$IS_DOCKER_CONTAINER" == "true" ]]; then
-            # 尝试获取容器镜像信息
-            if [[ -f "/etc/os-release" ]]; then
-                local container_image=$(grep '^PRETTY_NAME=' /etc/os-release | cut -d= -f2 | tr -d '"' || echo "unknown")
-                print_message "$CYAN" "容器镜像: $container_image"
-            fi
-            
-            # 显示容器资源限制信息
-            local docker_mem=$(get_docker_memory_limit)
-            local docker_cpu=$(get_docker_cpu_limit)
-            
-            if [[ $docker_mem -gt 0 ]]; then
-                print_message "$CYAN" "容器内存限制: $((docker_mem / 1024)) MB"
-            fi
-            
-            if [[ $docker_cpu -gt 0 ]]; then
-                print_message "$CYAN" "容器CPU限制: $docker_cpu 核心"
-            fi
-        fi
     fi
 
     # 确保变量在全局可用
     export OS ARCH KERNEL_VERSION VER DISTRO_ID DISTRO_NAME
-    export IS_DOCKER_CONTAINER IS_CONTAINER CONTAINER_TYPE
+    export VIRTUALIZATION
 }
 
 # 检测包管理器（增强版）
@@ -967,71 +958,13 @@ EOF
     print_message "$GREEN" "配置已保存到 $CONFIG_FILE"
 }
 
-# 获取CPU使用率（增强Docker支持）
+# 获取CPU使用率
 get_cpu_usage() {
     local cpu_usage
     local cpu_load
 
-    # Docker容器环境特殊处理
-    if [[ "$IS_DOCKER_CONTAINER" == "true" ]]; then
-        # 获取容器CPU限制
-        local cpu_limit=$(get_docker_cpu_limit)
-        
-        # 使用容器环境的CPU统计
-        if [[ -f /proc/stat ]]; then
-            local cpu_line=$(head -n1 /proc/stat 2>/dev/null)
-            if [[ -n "$cpu_line" ]]; then
-                local cpu_times=($cpu_line)
-                if [[ ${#cpu_times[@]} -ge 8 ]]; then
-                    local idle=${cpu_times[4]}
-                    local iowait=${cpu_times[5]:-0}
-                    local total=0
-
-                    # 计算总CPU时间
-                    for i in {1..7}; do
-                        if [[ -n "${cpu_times[i]}" && "${cpu_times[i]}" =~ ^[0-9]+$ ]]; then
-                            total=$((total + cpu_times[i]))
-                        fi
-                    done
-
-                    if [[ $total -gt 0 ]]; then
-                        cpu_usage=$(echo "scale=1; 100 - (($idle + $iowait) * 100 / $total)" | bc 2>/dev/null || echo "0")
-                        
-                        # 如果设置了CPU限制，调整CPU使用率显示
-                        if [[ $cpu_limit -gt 0 ]]; then
-                            # 将CPU使用率按限制的核心数进行缩放
-                            local total_cpus=$(nproc 2>/dev/null || echo 1)
-                            if [[ $total_cpus -gt 0 ]]; then
-                                cpu_usage=$(echo "scale=1; $cpu_usage * $cpu_limit / $total_cpus" | bc 2>/dev/null || echo "$cpu_usage")
-                            fi
-                        fi
-                    fi
-                fi
-            fi
-        fi
-        
-        # Docker容器负载平均值
-        local load1="0" load5="0" load15="0"
-        if [[ -f /proc/loadavg ]]; then
-            local load_data=$(cat /proc/loadavg 2>/dev/null | awk '{print $1" "$2" "$3}' || echo "0 0 0")
-            read -r load1 load5 load15 <<< "$load_data"
-            
-            # 根据CPU限制调整负载显示
-            if [[ $cpu_limit -gt 0 ]]; then
-                local scale_factor=$(echo "scale=2; $cpu_limit / 1" | bc 2>/dev/null || echo "1")
-                load1=$(echo "scale=2; $load1 / $scale_factor" | bc 2>/dev/null || echo "$load1")
-                load5=$(echo "scale=2; $load5 / $scale_factor" | bc 2>/dev/null || echo "$load5")
-                load15=$(echo "scale=2; $load15 / $scale_factor" | bc 2>/dev/null || echo "$load15")
-            fi
-        fi
-        
-        load1=$(sanitize_number "$load1" "0")
-        load5=$(sanitize_number "$load5" "0")
-        load15=$(sanitize_number "$load15" "0")
-        cpu_load="$load1,$load5,$load15"
-        
     # FreeBSD系统
-    elif [[ "$OS" == "FreeBSD" ]]; then
+    if [[ "$OS" == "FreeBSD" ]]; then
         # 使用sysctl获取CPU使用率
         if command_exists sysctl; then
             local cpu_idle=$(sysctl -n kern.cp_time 2>/dev/null | awk '{print $5}' 2>/dev/null || echo "0")
@@ -1156,71 +1089,12 @@ get_cpu_usage() {
     echo "{\"usage_percent\":$cpu_usage,\"load_avg\":[$cpu_load]}"
 }
 
-# 获取内存使用情况（增强Docker支持）
+# 获取内存使用情况
 get_memory_usage() {
     local total used free usage_percent
 
-    # Docker容器环境特殊处理
-    if [[ "$IS_DOCKER_CONTAINER" == "true" ]]; then
-        # 获取容器内存限制
-        local docker_mem_limit=$(get_docker_memory_limit)
-        
-        # 获取容器内存使用
-        local mem_usage=0
-        local mem_total=0
-        
-        # 优先使用cgroup内存统计
-        if [[ -f "/sys/fs/cgroup/memory.current" ]]; then
-            # cgroup v2
-            mem_usage=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo "0")
-            if [[ $docker_mem_limit -gt 0 ]]; then
-                mem_total=$((docker_mem_limit * 1024))  # 转换为字节
-            else
-                # 如果没有限制，使用主机内存（通过/proc/meminfo）
-                if [[ -f /proc/meminfo ]]; then
-                    mem_total=$(grep "^MemTotal:" /proc/meminfo | awk '{print $2 * 1024}' 2>/dev/null || echo "0")
-                fi
-            fi
-        elif [[ -f "/sys/fs/cgroup/memory/memory.usage_in_bytes" ]]; then
-            # cgroup v1
-            mem_usage=$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null || echo "0")
-            if [[ $docker_mem_limit -gt 0 ]]; then
-                mem_total=$((docker_mem_limit * 1024))  # 转换为字节
-            else
-                # 如果没有限制，使用主机内存
-                if [[ -f /proc/meminfo ]]; then
-                    mem_total=$(grep "^MemTotal:" /proc/meminfo | awk '{print $2 * 1024}' 2>/dev/null || echo "0")
-                fi
-            fi
-        else
-            # 回退到标准方法
-            if [[ -f /proc/meminfo ]]; then
-                mem_total=$(grep "^MemTotal:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
-                local mem_free=$(grep "^MemFree:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
-                local buffers=$(grep "^Buffers:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
-                local cached=$(grep "^Cached:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
-                local sreclaimable=$(grep "^SReclaimable:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
-                
-                free=$((mem_free + buffers + cached + sreclaimable))
-                used=$((mem_total - free))
-                mem_total=$mem_total  # 保持为KB
-                mem_usage=$((used * 1024))  # 转换为字节
-            fi
-        fi
-        
-        # 转换为KB（与原有格式保持一致）
-        if [[ $mem_total -gt 0 ]]; then
-            total=$((mem_total / 1024))
-            used=$((mem_usage / 1024))
-            free=$((total - used))
-        else
-            total=0
-            used=0
-            free=0
-        fi
-        
     # FreeBSD系统
-    elif [[ "$OS" == "FreeBSD" ]]; then
+    if [[ "$OS" == "FreeBSD" ]]; then
         if command_exists sysctl; then
             # FreeBSD内存信息
             local page_size=$(sysctl -n hw.pagesize 2>/dev/null || echo "4096")
@@ -1312,7 +1186,6 @@ get_memory_usage() {
         fi
 
         # 方法3: 容器环境特殊处理 (Cgroup V1 & V2)
-        # 即使没有CONTAINER_ENV变量，如果检测到cgroup限制且限制合理，也优先使用
         local cgroup_limit="0"
         local cgroup_usage="0"
         local cgroup_found=false
@@ -1423,88 +1296,56 @@ get_memory_usage() {
     echo "{\"total\":$total,\"used\":$used,\"free\":$free,\"usage_percent\":$usage_percent}"
 }
 
-# 获取磁盘使用情况（增强Docker支持）
+# 获取磁盘使用情况
 get_disk_usage() {
     local total used free usage_percent
 
-    # Docker容器环境特殊处理
-    if [[ "$IS_DOCKER_CONTAINER" == "true" ]]; then
-        # Docker容器中，默认监控根目录
-        local mount_point="/"
-        
-        # 尝试获取容器的存储驱动信息
-        if command_exists df; then
-            local disk_info=$(df -k "$mount_point" 2>/dev/null | tail -1)
-            if [[ -n "$disk_info" ]]; then
-                total=$(echo "$disk_info" | awk '{printf "%.2f", $2 / 1024 / 1024}' 2>/dev/null || echo "0")
-                used=$(echo "$disk_info" | awk '{printf "%.2f", $3 / 1024 / 1024}' 2>/dev/null || echo "0")
-                free=$(echo "$disk_info" | awk '{printf "%.2f", $4 / 1024 / 1024}' 2>/dev/null || echo "0")
-                usage_percent=$(echo "$disk_info" | awk '{print $5}' | tr -d '%' 2>/dev/null || echo "0")
-                
-                # 验证数据有效性
-                total=$(sanitize_number "$total" "0")
-                used=$(sanitize_number "$used" "0")
-                free=$(sanitize_number "$free" "0")
-                usage_percent=$(sanitize_integer "$usage_percent" "0")
-            else
-                total="0"
-                used="0"
-                free="0"
-                usage_percent="0"
-            fi
+    # 多种方法获取磁盘信息，提高兼容性
+    if command_exists df; then
+        # 使用-k参数确保输出单位一致（KB）
+        local disk_info=$(df -k / 2>/dev/null | tail -1)
+        if [[ -n "$disk_info" ]]; then
+            # 从KB转换为GB，使用awk进行更安全的计算
+            total=$(echo "$disk_info" | awk '{printf "%.2f", $2 / 1024 / 1024}' 2>/dev/null || echo "0")
+            used=$(echo "$disk_info" | awk '{printf "%.2f", $3 / 1024 / 1024}' 2>/dev/null || echo "0")
+            free=$(echo "$disk_info" | awk '{printf "%.2f", $4 / 1024 / 1024}' 2>/dev/null || echo "0")
+            usage_percent=$(echo "$disk_info" | awk '{print $5}' | tr -d '%' 2>/dev/null || echo "0")
+
+            # 验证数据有效性
+            total=$(sanitize_number "$total" "0")
+            used=$(sanitize_number "$used" "0")
+            free=$(sanitize_number "$free" "0")
+            usage_percent=$(sanitize_integer "$usage_percent" "0")
         else
             total="0"
             used="0"
             free="0"
             usage_percent="0"
-        fi
-        
-        # 如果没有获取到有效数据，尝试备用方法
-        if [[ "$total" == "0" ]] && [[ -d "$mount_point" ]]; then
-            # 使用du命令估算（不准确，但作为备用）
-            if command_exists du; then
-                local disk_size=$(du -sk "$mount_point" 2>/dev/null | awk '{print $1}' || echo "0")
-                total=$(echo "scale=2; $disk_size / 1024 / 1024" | bc 2>/dev/null || echo "0")
-                # 假设使用率为50%（因为无法准确获取）
-                used=$(echo "scale=2; $total * 0.5" | bc 2>/dev/null || echo "0")
-                free=$(echo "scale=2; $total - $used" | bc 2>/dev/null || echo "0")
-                usage_percent="50"
-                
-                total=$(sanitize_number "$total" "0")
-                used=$(sanitize_number "$used" "0")
-                free=$(sanitize_number "$free" "0")
-                usage_percent=$(sanitize_integer "$usage_percent" "0")
-            fi
         fi
     else
-        # 多种方法获取磁盘信息，提高兼容性
-        if command_exists df; then
-            # 使用-k参数确保输出单位一致（KB）
-            local disk_info=$(df -k / 2>/dev/null | tail -1)
-            if [[ -n "$disk_info" ]]; then
-                # 从KB转换为GB，使用awk进行更安全的计算
-                total=$(echo "$disk_info" | awk '{printf "%.2f", $2 / 1024 / 1024}' 2>/dev/null || echo "0")
-                used=$(echo "$disk_info" | awk '{printf "%.2f", $3 / 1024 / 1024}' 2>/dev/null || echo "0")
-                free=$(echo "$disk_info" | awk '{printf "%.2f", $4 / 1024 / 1024}' 2>/dev/null || echo "0")
-                usage_percent=$(echo "$disk_info" | awk '{print $5}' | tr -d '%' 2>/dev/null || echo "0")
+        # 如果df不可用，尝试其他方法
+        total="0"
+        used="0"
+        free="0"
+        usage_percent="0"
+    fi
 
-                # 验证数据有效性
+    # 容器环境特殊处理
+    if [[ "${CONTAINER_ENV:-false}" == "true" && "$total" == "0" ]]; then
+        # 在容器中，尝试获取当前目录的磁盘使用情况
+        if command_exists df; then
+            local container_disk=$(df -k . 2>/dev/null | tail -1)
+            if [[ -n "$container_disk" ]]; then
+                total=$(echo "$container_disk" | awk '{printf "%.2f", $2 / 1024 / 1024}' 2>/dev/null || echo "0")
+                used=$(echo "$container_disk" | awk '{printf "%.2f", $3 / 1024 / 1024}' 2>/dev/null || echo "0")
+                free=$(echo "$container_disk" | awk '{printf "%.2f", $4 / 1024 / 1024}' 2>/dev/null || echo "0")
+                usage_percent=$(echo "$container_disk" | awk '{print $5}' | tr -d '%' 2>/dev/null || echo "0")
+
                 total=$(sanitize_number "$total" "0")
                 used=$(sanitize_number "$used" "0")
                 free=$(sanitize_number "$free" "0")
                 usage_percent=$(sanitize_integer "$usage_percent" "0")
-            else
-                total="0"
-                used="0"
-                free="0"
-                usage_percent="0"
             fi
-        else
-            # 如果df不可用，尝试其他方法
-            total="0"
-            used="0"
-            free="0"
-            usage_percent="0"
         fi
     fi
 
@@ -1518,80 +1359,8 @@ get_network_usage() {
     local total_upload=0
     local total_download=0
 
-    # Docker容器环境特殊处理
-    if [[ "$IS_DOCKER_CONTAINER" == "true" ]]; then
-        # Docker容器中，通常使用eth0作为默认网络接口
-        local interface="eth0"
-        
-        # 检查接口是否存在
-        if [[ -f "/sys/class/net/$interface" ]] || (command_exists ip && ip link show "$interface" >/dev/null 2>&1); then
-            # 使用/proc/net/dev获取网络统计
-            if [[ -f "/proc/net/dev" ]]; then
-                local net_line=$(grep "^ *$interface:" /proc/net/dev 2>/dev/null)
-                if [[ -n "$net_line" ]]; then
-                    local stats=($net_line)
-                    total_download=${stats[1]}  # 接收字节数
-                    total_upload=${stats[9]}    # 发送字节数
-                    
-                    # 确保是数字
-                    if ! [[ "$total_download" =~ ^[0-9]+$ ]]; then
-                        total_download=0
-                    fi
-                    if ! [[ "$total_upload" =~ ^[0-9]+$ ]]; then
-                        total_upload=0
-                    fi
-                fi
-            fi
-            
-            # 计算速度
-            local speed_file="${TMPDIR:-/tmp}/vps_monitor_net_${interface}_$(whoami)"
-            mkdir -p "$(dirname "$speed_file")" 2>/dev/null
-            local current_time=$(date +%s)
-
-            if [[ -f "$speed_file" ]]; then
-                local last_data=$(cat "$speed_file")
-                local last_time=$(echo "$last_data" | cut -d' ' -f1)
-                local last_rx=$(echo "$last_data" | cut -d' ' -f2)
-                local last_tx=$(echo "$last_data" | cut -d' ' -f3)
-
-                local time_diff=$((current_time - last_time))
-                if [[ $time_diff -gt 0 ]]; then
-                    download_speed=$(( (total_download - last_rx) / time_diff ))
-                    upload_speed=$(( (total_upload - last_tx) / time_diff ))
-
-                    # 确保速度不为负数
-                    [[ $download_speed -lt 0 ]] && download_speed=0
-                    [[ $upload_speed -lt 0 ]] && upload_speed=0
-                fi
-            fi
-
-            # 保存当前数据供下次使用
-            echo "$current_time $total_download $total_upload" > "$speed_file"
-        else
-            # 如果eth0不存在，尝试查找其他接口
-            if [[ -f "/proc/net/dev" ]]; then
-                # 查找第一个非lo接口
-                interface=$(awk '/^ *[^:]*:/ {
-                    gsub(/:/, "", $1)
-                    if ($1 != "lo") {
-                        print $1
-                        exit
-                    }
-                }' /proc/net/dev)
-                
-                if [[ -n "$interface" ]]; then
-                    # 重新获取该接口的数据
-                    local net_line=$(grep "^ *$interface:" /proc/net/dev 2>/dev/null)
-                    if [[ -n "$net_line" ]]; then
-                        local stats=($net_line)
-                        total_download=${stats[1]}
-                        total_upload=${stats[9]}
-                    fi
-                fi
-            fi
-        fi
     # FreeBSD系统
-    elif [[ "$OS" == "FreeBSD" ]]; then
+    if [[ "$OS" == "FreeBSD" ]]; then
         # 获取默认网络接口
         local interface=""
 
@@ -1688,6 +1457,7 @@ get_network_usage() {
 
         # 方法4: 查找活跃的网络接口（改进版）
         if [[ -z "$interface" && -f "/proc/net/dev" ]]; then
+            # 查找有流量的接口（排除lo和虚拟接口）
             # 查找有流量的接口（排除lo和虚拟接口）
             interface=$(awk '/^ *[^:]*:/ {
                 gsub(/:/, "", $1)
@@ -1793,24 +1563,8 @@ get_network_usage() {
 get_uptime() {
     local uptime_seconds=0
 
-    # Docker容器环境
-    if [[ "$IS_DOCKER_CONTAINER" == "true" ]]; then
-        # Docker容器中，使用容器启动时间
-        if [[ -f "/proc/uptime" ]]; then
-            uptime_seconds=$(cut -d. -f1 /proc/uptime)
-        else
-            # 备选方法：检查容器的启动时间
-            if [[ -f "/proc/1/stat" ]]; then
-                local start_time=$(cat /proc/1/stat 2>/dev/null | awk '{print $22}')
-                local current_time=$(date +%s)
-                local clock_ticks_per_second=$(getconf CLK_TCK 2>/dev/null || echo 100)
-                if [[ -n "$start_time" ]] && [[ "$start_time" =~ ^[0-9]+$ ]]; then
-                    uptime_seconds=$(( (current_time - (start_time / clock_ticks_per_second)) ))
-                fi
-            fi
-        fi
     # FreeBSD系统
-    elif [[ "$OS" == "FreeBSD" ]]; then
+    if [[ "$OS" == "FreeBSD" ]]; then
         if command_exists sysctl; then
             # FreeBSD使用sysctl获取启动时间
             local boot_time_raw=$(sysctl -n kern.boottime 2>/dev/null | awk '{print $4}' | tr -d ',' 2>/dev/null || echo "0")
@@ -1880,8 +1634,98 @@ sanitize_integer() {
 # 清理JSON字符串
 clean_json_string() {
     local input="$1"
-    # 移除可能的控制字符和非打印字符
-    echo "$input" | tr -d '\000-\037' | tr -d '\177-\377'
+    
+    if [[ -z "$input" ]]; then
+        echo ""
+        return
+    fi
+    
+    # 移除所有控制字符（ASCII 0-31，127）
+    input=$(echo "$input" | tr -d '\000-\031' | tr -d '\177')
+    
+    # 转义特殊JSON字符
+    input=$(echo "$input" | sed 's/\\/\\\\/g')  # 反斜杠
+    input=$(echo "$input" | sed 's/"/\\"/g')    # 双引号
+    input=$(echo "$input" | sed 's/\//\\\//g')  # 正斜杠
+    input=$(echo "$input" | sed 's/\x08/\\b/g') # 退格
+    input=$(echo "$input" | sed 's/\x0C/\\f/g') # 换页
+    input=$(echo "$input" | sed 's/\x0A/\\n/g') # 换行
+    input=$(echo "$input" | sed 's/\x0D/\\r/g') # 回车
+    input=$(echo "$input" | sed 's/\x09/\\t/g') # 制表符
+    
+    echo "$input"
+}
+
+# 验证JSON格式
+validate_json() {
+    local json="$1"
+    
+    if [[ -z "$json" ]]; then
+        return 1
+    fi
+    
+    # 简单验证JSON结构（不依赖jq）
+    if [[ "$json" =~ ^\{.*\}$ ]]; then
+        # 检查是否有未闭合的引号
+        local quote_count=$(echo "$json" | tr -cd '"' | wc -c)
+        if [[ $((quote_count % 2)) -eq 0 ]]; then
+            # 检查是否有未转义的控制字符
+            if ! echo "$json" | grep -q $'[\x00-\x1F\x7F]'; then
+                return 0
+            fi
+        fi
+    fi
+    
+    return 1
+}
+
+# 构建安全的JSON数据
+build_safe_json() {
+    local timestamp="$1"
+    local cpu_raw="$2"
+    local memory_raw="$3"
+    local disk_raw="$4"
+    local network_raw="$5"
+    local uptime_raw="$6"
+    
+    # 清理所有输入数据
+    timestamp=$(sanitize_integer "$timestamp" "0")
+    uptime_raw=$(sanitize_integer "$uptime_raw" "0")
+    
+    # 验证各个JSON组件
+    if ! validate_json "$cpu_raw"; then
+        log "警告: CPU数据格式无效，使用默认值"
+        cpu_raw='{"usage_percent":0,"load_avg":[0,0,0]}'
+    fi
+    
+    if ! validate_json "$memory_raw"; then
+        log "警告: 内存数据格式无效，使用默认值"
+        memory_raw='{"total":0,"used":0,"free":0,"usage_percent":0}'
+    fi
+    
+    if ! validate_json "$disk_raw"; then
+        log "警告: 磁盘数据格式无效，使用默认值"
+        disk_raw='{"total":0,"used":0,"free":0,"usage_percent":0}'
+    fi
+    
+    if ! validate_json "$network_raw"; then
+        log "警告: 网络数据格式无效，使用默认值"
+        network_raw='{"upload_speed":0,"download_speed":0,"total_upload":0,"total_download":0}'
+    fi
+    
+    # 构建最终JSON（直接构造，避免复杂处理）
+    local data="{\"timestamp\":$timestamp,\"cpu\":$cpu_raw,\"memory\":$memory_raw,\"disk\":$disk_raw,\"network\":$network_raw,\"uptime\":$uptime_raw,\"container\":{\"is_container\":${CONTAINER_ENV:-false},\"container_type\":\"${CONTAINER_TYPE:-none}\"}}"
+    
+    # 最终验证
+    if validate_json "$data"; then
+        echo "$data"
+        return 0
+    else
+        # 如果仍然无效，使用最简化的版本
+        log "错误: JSON构建失败，使用简化数据"
+        echo '{"timestamp":0,"cpu":{"usage_percent":0,"load_avg":[0,0,0]},"memory":{"total":0,"used":0,"free":0,"usage_percent":0},"disk":{"total":0,"used":0,"free":0,"usage_percent":0},"network":{"upload_speed":0,"download_speed":0,"total_upload":0,"total_download":0},"uptime":0,"container":{"is_container":false,"container_type":"none"}}'
+        return 1
+    fi
 }
 
 # 获取服务器配置（带简单重试）
@@ -1972,7 +1816,7 @@ load_config_cache() {
     return 1
 }
 
-# 上报监控数据
+# 上报监控数据（优化版）
 report_metrics() {
     local timestamp=$(date +%s)
     local cpu_raw=$(get_cpu_usage)
@@ -1981,24 +1825,9 @@ report_metrics() {
     local network_raw=$(get_network_usage)
     local uptime_raw=$(get_uptime)
 
-    # 验证运行时间
-    local uptime=$(sanitize_integer "$uptime_raw" "0")
-
-    # 清理JSON数据
-    cpu_raw=$(clean_json_string "$cpu_raw")
-    memory_raw=$(clean_json_string "$memory_raw")
-    disk_raw=$(clean_json_string "$disk_raw")
-    network_raw=$(clean_json_string "$network_raw")
-
-    # 简单验证JSON格式
-    [[ ! "$cpu_raw" =~ ^\{.*\}$ ]] && cpu_raw='{"usage_percent":0,"load_avg":[0,0,0]}'
-    [[ ! "$memory_raw" =~ ^\{.*\}$ ]] && memory_raw='{"total":0,"used":0,"free":0,"usage_percent":0}'
-    [[ ! "$disk_raw" =~ ^\{.*\}$ ]] && disk_raw='{"total":0,"used":0,"free":0,"usage_percent":0}'
-    [[ ! "$network_raw" =~ ^\{.*\}$ ]] && network_raw='{"upload_speed":0,"download_speed":0,"total_upload":0,"total_download":0}'
-
-    # 构建JSON数据
-    local data="{\"timestamp\":$timestamp,\"cpu\":$cpu_raw,\"memory\":$memory_raw,\"disk\":$disk_raw,\"network\":$network_raw,\"uptime\":$uptime}"
-
+    # 使用新的安全JSON构建函数
+    local data=$(build_safe_json "$timestamp" "$cpu_raw" "$memory_raw" "$disk_raw" "$network_raw" "$uptime_raw")
+    
     # 确保API KEY和ID没有多余的空格或换行
     local clean_api_key=$(echo "$API_KEY" | tr -d ' \n\r')
     local clean_server_id=$(echo "$SERVER_ID" | tr -d ' \n\r')
@@ -2075,7 +1904,7 @@ report_metrics() {
     fi
 }
 
-# 创建监控服务脚本
+# 创建监控服务脚本（更新版）
 create_service_script() {
     # 获取当前脚本的绝对路径
     local main_script_path=$(realpath "$0")
@@ -2121,11 +1950,96 @@ source_monitoring_functions() {
 # 加载监控函数
 source_monitoring_functions
 
-# 清理JSON字符串
+# 清理JSON字符串（安全版）
 clean_json_string() {
     local input="\$1"
-    # 移除可能的控制字符和非打印字符
-    echo "\$input" | tr -d '\\000-\\037' | tr -d '\\177-\\377'
+    
+    if [[ -z "\$input" ]]; then
+        echo ""
+        return
+    fi
+    
+    # 移除所有控制字符（ASCII 0-31，127）
+    input=\$(echo "\$input" | tr -d '\\000-\\031' | tr -d '\\177')
+    
+    # 转义特殊JSON字符
+    input=\$(echo "\$input" | sed 's/\\\\/\\\\\\\\/g')  # 反斜杠
+    input=\$(echo "\$input" | sed 's/"/\\\\"/g')        # 双引号
+    input=\$(echo "\$input" | sed 's/\\//\\\\\\//g')    # 正斜杠
+    
+    echo "\$input"
+}
+
+# 验证JSON格式
+validate_json() {
+    local json="\$1"
+    
+    if [[ -z "\$json" ]]; then
+        return 1
+    fi
+    
+    # 简单验证JSON结构
+    if [[ "\$json" =~ ^\\{.*\\}\$ ]]; then
+        # 检查是否有未闭合的引号
+        local quote_count=\$(echo "\$json" | tr -cd '"' | wc -c)
+        if [[ \$((quote_count % 2)) -eq 0 ]]; then
+            # 检查是否有未转义的控制字符
+            if ! echo "\$json" | grep -q \$'[\\x00-\\x1F\\x7F]'; then
+                return 0
+            fi
+        fi
+    fi
+    
+    return 1
+}
+
+# 构建安全的JSON数据
+build_safe_json() {
+    local timestamp="\$1"
+    local cpu_raw="\$2"
+    local memory_raw="\$3"
+    local disk_raw="\$4"
+    local network_raw="\$5"
+    local uptime_raw="\$6"
+    
+    # 清理所有输入数据
+    timestamp=\$(sanitize_integer "\$timestamp" "0")
+    uptime_raw=\$(sanitize_integer "\$uptime_raw" "0")
+    
+    # 验证各个JSON组件
+    if ! validate_json "\$cpu_raw"; then
+        log "警告: CPU数据格式无效，使用默认值"
+        cpu_raw='{\\"usage_percent\\":0,\\"load_avg\\":[0,0,0]}'
+    fi
+    
+    if ! validate_json "\$memory_raw"; then
+        log "警告: 内存数据格式无效，使用默认值"
+        memory_raw='{\\"total\\":0,\\"used\\":0,\\"free\\":0,\\"usage_percent\\":0}'
+    fi
+    
+    if ! validate_json "\$disk_raw"; then
+        log "警告: 磁盘数据格式无效，使用默认值"
+        disk_raw='{\\"total\\":0,\\"used\\":0,\\"free\\":0,\\"usage_percent\\":0}'
+    fi
+    
+    if ! validate_json "\$network_raw"; then
+        log "警告: 网络数据格式无效，使用默认值"
+        network_raw='{\\"upload_speed\\":0,\\"download_speed\\":0,\\"total_upload\\":0,\\"total_download\\":0}'
+    fi
+    
+    # 构建最终JSON（直接构造，避免复杂处理）
+    local data="{\\"timestamp\\":\$timestamp,\\"cpu\\":\$cpu_raw,\\"memory\\":\$memory_raw,\\"disk\\":\$disk_raw,\\"network\\":\$network_raw,\\"uptime\\":\$uptime_raw,\\"container\\":{\\"is_container\\":\${CONTAINER_ENV:-false},\\"container_type\\":\\"\${CONTAINER_TYPE:-none}\\"}}"
+    
+    # 最终验证
+    if validate_json "\$data"; then
+        echo "\$data"
+        return 0
+    else
+        # 如果仍然无效，使用最简化的版本
+        log "错误: JSON构建失败，使用简化数据"
+        echo '{\\"timestamp\\":0,\\"cpu\\":{\\"usage_percent\\":0,\\"load_avg\\":[0,0,0]},\\"memory\\":{\\"total\\":0,\\"used\\":0,\\"free\\":0,\\"usage_percent\\":0},\\"disk\\":{\\"total\\":0,\\"used\\":0,\\"free\\":0,\\"usage_percent\\":0},\\"network\\":{\\"upload_speed\\":0,\\"download_speed\\":0,\\"total_upload\\":0,\\"total_download\\":0},\\"uptime\\":0,\\"container\\":{\\"is_container\\":false,\\"container_type\\":\\"none\\"}}'
+        return 1
+    fi
 }
 
 # 上报监控数据
@@ -2139,32 +2053,8 @@ report_metrics() {
     local network_raw=\$(get_network_usage)
     local uptime_raw=\$(get_uptime)
 
-    # 验证运行时间
-    local uptime=\$(sanitize_integer "\$uptime_raw" "0")
-
-    # 清理JSON数据
-    cpu_raw=\$(clean_json_string "\$cpu_raw")
-    memory_raw=\$(clean_json_string "\$memory_raw")
-    disk_raw=\$(clean_json_string "\$disk_raw")
-    network_raw=\$(clean_json_string "\$network_raw")
-
-    # 验证各个JSON组件（使用更宽松的验证）
-    if [[ -z "\$cpu_raw" || "\$cpu_raw" == "{}" || ! "\$cpu_raw" =~ ^\{.*\}\$ ]]; then
-        cpu_raw='{\\"usage_percent\\":0,\\"load_avg\\":[0,0,0]}'
-    fi
-    if [[ -z "\$memory_raw" || "\$memory_raw" == "{}" || ! "\$memory_raw" =~ ^\{.*\}\$ ]]; then
-        memory_raw='{\\"total\\":0,\\"used\\":0,\\"free\\":0,\\"usage_percent\\":0}'
-    fi
-    if [[ -z "\$disk_raw" || "\$disk_raw" == "{}" || ! "\$disk_raw" =~ ^\{.*\}\$ ]]; then
-        disk_raw='{\\"total\\":0,\\"used\\":0,\\"free\\":0,\\"usage_percent\\":0}'
-    fi
-    if [[ -z "\$network_raw" || "\$network_raw" == "{}" || ! "\$network_raw" =~ ^\{.*\}\$ ]]; then
-        network_raw='{\\"upload_speed\\":0,\\"download_speed\\":0,\\"total_upload\\":0,\\"total_download\\":0}'
-    fi
-
-
-    # 构建JSON数据
-    local data="{\\"timestamp\\":\$timestamp,\\"cpu\\":\$cpu_raw,\\"memory\\":\$memory_raw,\\"disk\\":\$disk_raw,\\"network\\":\$network_raw,\\"uptime\\":\$uptime}"
+    # 使用安全JSON构建函数
+    local data=\$(build_safe_json "\$timestamp" "\$cpu_raw" "\$memory_raw" "\$disk_raw" "\$network_raw" "\$uptime_raw")
 
     # 确保API KEY和ID没有多余的空格或换行
     local clean_api_key=\$(echo "\$API_KEY" | tr -d ' \\n\\r')
@@ -2742,13 +2632,6 @@ check_service_status() {
         print_message "$CYAN" "  Server ID: $SERVER_ID"
         print_message "$CYAN" "  API Key: ${API_KEY:0:8}..."
         print_message "$CYAN" "  上报间隔: ${INTERVAL}秒"
-        
-        # 显示Docker容器信息（如果检测到）
-        if [[ "$IS_DOCKER_CONTAINER" == "true" ]]; then
-            print_message "$CYAN" "  运行环境: Docker容器"
-        elif [[ "$IS_CONTAINER" == "true" ]]; then
-            print_message "$CYAN" "  运行环境: 容器 ($CONTAINER_TYPE)"
-        fi
     else
         print_message "$YELLOW" "  ✗ 配置文件不存在"
     fi
@@ -3125,7 +3008,7 @@ install_monitor() {
         print_message "$YELLOW" "系统资源紧张，启用简化模式"
     fi
 
-    # 检测系统（包含Docker检测）
+    # 检测系统
     detect_system
     detect_package_manager
 
@@ -3180,14 +3063,6 @@ install_monitor() {
         else
             print_message "$GREEN" "  启动方式: 传统后台进程"
         fi
-        
-        # 显示环境信息
-        if [[ "$IS_DOCKER_CONTAINER" == "true" ]]; then
-            print_message "$CYAN" "  运行环境: Docker容器 (已优化资源监控)"
-        elif [[ "$IS_CONTAINER" == "true" ]]; then
-            print_message "$CYAN" "  运行环境: 容器 ($CONTAINER_TYPE)"
-        fi
-        
         echo
         print_message "$GREEN" "✓ 已配置多重自启动保障，VPS重启后将自动运行"
         echo
@@ -3303,7 +3178,7 @@ uninstall_monitor() {
 
 # 显示帮助信息
 show_help() {
-    echo "VPS监控脚本 v2.0 (增强Docker支持)"
+    echo "VPS监控脚本 v2.0"
     echo
     echo "用法: $0 [选项] [参数]"
     echo
@@ -3335,11 +3210,7 @@ show_help() {
     echo "一键安装示例:"
     echo "  $0 -i -s server123 -k abc123 -u https://worker.example.com"
     echo
-    echo "特性:"
-    echo "  - 自动检测Docker容器环境"
-    echo "  - 支持容器资源限制监控"
-    echo "  - 上报间隔自动从服务器获取"
-    echo "  - 支持多重自启动保障"
+    echo "注意: 上报间隔会自动从服务器获取，无需手动设置"
 }
 
 # 显示交互菜单
@@ -3518,7 +3389,7 @@ one_click_install() {
     echo "  初始上报间隔: ${interval}秒 (运行后会自动从服务器获取最新配置)"
     echo
 
-    # 检测系统（包含Docker检测）
+    # 检测系统
     detect_system
     detect_package_manager
 
@@ -3587,14 +3458,6 @@ one_click_install() {
         else
             print_message "$GREEN" "  启动方式: 传统后台进程"
         fi
-        
-        # 显示环境信息
-        if [[ "$IS_DOCKER_CONTAINER" == "true" ]]; then
-            print_message "$CYAN" "  运行环境: Docker容器 (已优化资源监控)"
-        elif [[ "$IS_CONTAINER" == "true" ]]; then
-            print_message "$CYAN" "  运行环境: 容器 ($CONTAINER_TYPE)"
-        fi
-        
         echo
         print_message "$GREEN" "✓ 已配置多重自启动保障，VPS重启后将自动运行"
         echo
