@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # cf-vps-monitor - Cloudflare Worker VPS监控脚本
-# 版本: 1.1.0
+# 版本: 2.1.0
 # 支持所有常见Linux系统，无需root权限
 
 set -euo pipefail
@@ -467,55 +467,24 @@ execute_system_command() {
     esac
 }
 
-# 增强的容器检测函数
-detect_container_environment() {
-    local container_type="none"
-    local is_container="false"
-    
-    # 多种方式检测容器环境
-    if [[ -f /.dockerenv ]]; then
-        container_type="docker"
-        is_container="true"
-    elif [[ -f /run/.containerenv ]]; then
-        container_type="podman"
-        is_container="true"
-    elif [[ -f /proc/1/cgroup ]]; then
-        # 检查cgroup中是否包含容器标识
-        if grep -q "docker\|lxc\|kubepods\|containerd" /proc/1/cgroup 2>/dev/null; then
-            if grep -q "docker" /proc/1/cgroup 2>/dev/null; then
-                container_type="docker"
-            elif grep -q "lxc" /proc/1/cgroup 2>/dev/null; then
-                container_type="lxc"
-            elif grep -q "kubepods" /proc/1/cgroup 2>/dev/null; then
-                container_type="kubernetes"
-            else
-                container_type="container"
-            fi
-            is_container="true"
-        fi
-    fi
-    
-    echo "$is_container:$container_type"
-}
-
 # 检测系统信息（优化版 - 减少fork操作）
 detect_system() {
     # 一次性获取系统基本信息（减少fork）
     local system_info=$(uname -srm)
     IFS=' ' read -r OS KERNEL_VERSION ARCH <<< "$system_info"
 
-    # 检测容器环境
-    local container_info=$(detect_container_environment)
-    IFS=':' read -r IS_CONTAINER CONTAINER_TYPE <<< "$container_info"
-
     # FreeBSD特殊优化（避免不必要的检测）
     if [[ "$OS" == "FreeBSD" ]]; then
+        IS_CONTAINER="false"
+        CONTAINER_TYPE="none"
         VIRTUALIZATION="none"
         VER=$(echo "$KERNEL_VERSION" | cut -d'-' -f1)
         DISTRO_ID="freebsd"
         DISTRO_NAME="FreeBSD"
         print_message "$GREEN" "检测到系统: FreeBSD $VER"
     elif [[ "$OS" == "Darwin" ]]; then
+        IS_CONTAINER="false"
+        CONTAINER_TYPE="none"
         VIRTUALIZATION="none"
         VER=$(sw_vers -productVersion 2>/dev/null || echo "$KERNEL_VERSION")
         DISTRO_ID="macos"
@@ -523,7 +492,15 @@ detect_system() {
         print_message "$GREEN" "检测到系统: macOS $VER"
     else
         # Linux系统的简化检测
+        IS_CONTAINER="false"
+        CONTAINER_TYPE="none"
         VIRTUALIZATION="none"
+
+        # 简化的容器检测（只检查明显标志）
+        if [[ -f /.dockerenv ]]; then
+            IS_CONTAINER="true"
+            CONTAINER_TYPE="docker"
+        fi
 
         # 简化的发行版检测
         if [[ -f /etc/os-release ]]; then
@@ -538,9 +515,6 @@ detect_system() {
         fi
 
         print_message "$GREEN" "检测到系统: $DISTRO_NAME $VER"
-        if [[ "$IS_CONTAINER" == "true" ]]; then
-            print_message "$CYAN" "容器环境: $CONTAINER_TYPE"
-        fi
     fi
 
     # 确保变量在全局可用
@@ -781,10 +755,6 @@ install_dependencies() {
     print_message "$GREEN" "依赖检查完成"
 }
 
-
-
-
-
 # 创建集中式目录结构
 create_directories() {
     print_message "$BLUE" "创建集中式目录结构..."
@@ -972,7 +942,7 @@ get_cpu_usage() {
     echo "{\"usage_percent\":$cpu_usage,\"load_avg\":[$cpu_load]}"
 }
 
-# 获取内存使用情况
+# 获取内存使用情况（优化版）
 get_memory_usage() {
     local total used free usage_percent
 
@@ -1017,141 +987,162 @@ get_memory_usage() {
             free=0
         fi
     else
-        # Linux系统 - 改进的内存计算逻辑
+        # Linux系统 - 优化内存计算逻辑
         total=0
         used=0
         free=0
 
-        # 使用增强的容器检测
-        local is_container="$IS_CONTAINER"
+        # 方法1: 使用free命令（最常用且最准确）
+        if command_exists free; then
+            local mem_info=$(free -k 2>/dev/null | grep "^Mem:")
+            if [[ -n "$mem_info" ]]; then
+                total=$(echo "$mem_info" | awk '{print $2}')
 
-        # 方法1: 检查cgroup限制（容器环境优先）
-        local cgroup_limit_kb=""
-        local cgroup_usage_kb=""
-        
-        # 检测Cgroup V2
-        if [[ -f /sys/fs/cgroup/memory.max ]]; then
-            local max_raw=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
-            if [[ "$max_raw" != "max" && "$max_raw" =~ ^[0-9]+$ ]]; then
-                cgroup_limit_kb=$((max_raw / 1024))
-                if [[ -f /sys/fs/cgroup/memory.current ]]; then
-                    cgroup_usage_kb=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo "0")
-                    cgroup_usage_kb=$((cgroup_usage_kb / 1024))
-                fi
-            fi
-        fi
-        
-        # 检测Cgroup V1
-        if [[ -z "$cgroup_limit_kb" && -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
-            local limit_raw=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo "0")
-            # 忽略极大的值（未限制情况）
-            if [[ "$limit_raw" =~ ^[0-9]+$ && "$limit_raw" -lt 9223372036854771712 ]]; then
-                cgroup_limit_kb=$((limit_raw / 1024))
-                cgroup_usage_kb=$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null || echo "0")
-                cgroup_usage_kb=$((cgroup_usage_kb / 1024))
-            fi
-        fi
+                # 尝试获取available列（第7列，现代Linux系统）
+                local available=$(echo "$mem_info" | awk '{print $7}' 2>/dev/null || echo "")
+                if [[ "$available" =~ ^[0-9]+$ ]]; then
+                    # 如果有available列，使用它作为真正的可用内存
+                    free=$available
+                    used=$((total - free))
+                else
+                    # 如果没有available列，使用传统方法计算
+                    local mem_free=$(echo "$mem_info" | awk '{print $4}' 2>/dev/null || echo "0")
+                    local buff_cache=$(echo "$mem_info" | awk '{print $6}' 2>/dev/null || echo "0")
 
-        # 如果在容器中找到了cgroup限制，优先使用它
-        if [[ "$is_container" == "true" && -n "$cgroup_limit_kb" && "$cgroup_limit_kb" -gt 0 ]]; then
-            total=$cgroup_limit_kb
-            used=$cgroup_usage_kb
-            free=$((total - used))
-            
-            # 验证容器内存数据
-            if [[ $used -lt 0 ]]; then
-                used=0
-            fi
-            if [[ $free -lt 0 ]]; then
-                free=0
-            fi
-            if [[ $total -gt 0 && $used -gt $total ]]; then
-                used=$total
-                free=0
-            fi
-            
-            # 如果cgroup数据无效，回退到free命令
-            if [[ $total -eq 0 ]]; then
-                is_container="false"
-            else
-                # 在容器环境中，我们优先信任cgroup数据
-                :
-            fi
-        fi
-
-        # 方法2: 如果不在容器中或cgroup数据不可用，使用传统方法
-        if [[ "$is_container" == "false" || $total -eq 0 ]]; then
-            if command_exists free; then
-                local mem_info=$(free -k 2>/dev/null | grep "^Mem:")
-                if [[ -n "$mem_info" ]]; then
-                    total=$(echo "$mem_info" | awk '{print $2}')
-                    
-                    # 现代系统有available列
-                    local available=$(echo "$mem_info" | awk '{print $7}' 2>/dev/null || echo "")
-                    if [[ "$available" =~ ^[0-9]+$ ]]; then
-                        free=$available
+                    # 验证数据有效性
+                    if [[ "$mem_free" =~ ^[0-9]+$ ]] && [[ "$buff_cache" =~ ^[0-9]+$ ]]; then
+                        free=$((mem_free + buff_cache))
                         used=$((total - free))
                     else
-                        # 传统方法
-                        local mem_free=$(echo "$mem_info" | awk '{print $4}' 2>/dev/null || echo "0")
-                        local buff_cache=$(echo "$mem_info" | awk '{print $6}' 2>/dev/null || echo "0")
-                        
-                        if [[ "$mem_free" =~ ^[0-9]+$ ]] && [[ "$buff_cache" =~ ^[0-9]+$ ]]; then
-                            free=$((mem_free + buff_cache))
-                            used=$((total - free))
-                        else
-                            local raw_used=$(echo "$mem_info" | awk '{print $3}' 2>/dev/null || echo "0")
-                            if [[ "$raw_used" =~ ^[0-9]+$ ]]; then
-                                used=$raw_used
-                                free=$((total - used))
-                            fi
+                        # 如果解析失败，使用第3列作为used，但需要重新计算free
+                        local raw_used=$(echo "$mem_info" | awk '{print $3}' 2>/dev/null || echo "0")
+                        if [[ "$raw_used" =~ ^[0-9]+$ ]]; then
+                            used=$raw_used
+                            free=$((total - used))
                         fi
                     fi
                 fi
             fi
+        fi
+
+        # 方法2: 直接读取/proc/meminfo（备用方法）
+        if [[ "$total" == "0" ]] && [[ -f /proc/meminfo ]]; then
+            total=$(grep "^MemTotal:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
+            local mem_free=$(grep "^MemFree:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
+            local buffers=$(grep "^Buffers:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
+            local cached=$(grep "^Cached:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
+            local sreclaimable=$(grep "^SReclaimable:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
+
+            # 计算实际可用内存（包括可回收的内存）
+            free=$((mem_free + buffers + cached + sreclaimable))
+            used=$((total - free))
+        fi
+
+        # 方法3: 容器环境特殊处理 (Cgroup V1 & V2)
+        # 即使没有CONTAINER_ENV变量，如果检测到cgroup限制且限制合理，也优先使用
+        local cgroup_limit="0"
+        local cgroup_usage="0"
+        local cgroup_found=false
+        
+        # 尝试检测 Cgroup V2
+        if [[ -f /sys/fs/cgroup/memory.max ]]; then
+            local max_raw=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
+            if [[ "$max_raw" != "max" && "$max_raw" =~ ^[0-9]+$ ]]; then
+                cgroup_limit="$max_raw"
+                if [[ -f /sys/fs/cgroup/memory.current ]]; then
+                    cgroup_usage=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo "0")
+                    cgroup_found=true
+                fi
+            fi
+        fi
+        
+        # 尝试检测 Cgroup V1 (如果V2没找到)
+        if [[ "$cgroup_found" == "false" && -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
+            local limit_raw=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo "0")
+            # 忽略极大的值 (未限制)
+            if [[ "$limit_raw" =~ ^[0-9]+$ && "$limit_raw" -lt 9223372036854771712 ]]; then
+                cgroup_limit="$limit_raw"
+                cgroup_usage=$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null || echo "0")
+                cgroup_found=true
+            fi
+        fi
+        
+        # 如果找到了有效的cgroup限制，并且限制值小于宿主机物理内存(total)，则使用cgroup数据
+        # 或者如果total是0（上面获取失败），直接使用cgroup数据
+        if [[ "$cgroup_found" == "true" ]]; then
+            local cgroup_total_kb=$((cgroup_limit / 1024))
             
-            # 方法3: 读取/proc/meminfo（备用）
-            if [[ "$total" == "0" ]] && [[ -f /proc/meminfo ]]; then
-                total=$(grep "^MemTotal:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
-                local mem_free=$(grep "^MemFree:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
-                local buffers=$(grep "^Buffers:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
-                local cached=$(grep "^Cached:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
-                local sreclaimable=$(grep "^SReclaimable:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
-                
-                free=$((mem_free + buffers + cached + sreclaimable))
-                used=$((total - free))
+            # 只有当cgroup限制明显即使有效（例如小于宿主机内存，或者我们确定是在容器里）时才使用
+            # 这里如果不确定宿主机内存，或者cgroup限制小于宿主机内存，就采用
+            if [[ "$total" == "0" || "$cgroup_total_kb" -lt "$total" ]]; then
+                total=$cgroup_total_kb
+                used=$((cgroup_usage / 1024))
+                free=$((total - used))
             fi
         fi
 
-        # 数据验证和修正
+        # 确保所有值都是有效数字
         total=$(sanitize_integer "$total" "0")
         used=$(sanitize_integer "$used" "0")
         free=$(sanitize_integer "$free" "0")
 
+        # 数据一致性验证和修正 - 优化版本
         if [[ $total -gt 0 ]]; then
-            # 确保 used + free = total
+            # 确保所有值都是有效数字
+            total=$(sanitize_integer "$total" "0")
+            used=$(sanitize_integer "$used" "0")
+            free=$(sanitize_integer "$free" "0")
+
+            # 确保 used + free = total 的一致性
             local sum=$((used + free))
-            if [[ $sum -ne $total ]]; then
-                # 重新计算used，保证一致性
-                used=$((total - free))
+            local diff=$((sum - total))
+
+            # 如果差异超过1%，说明数据有问题，需要修正
+            local tolerance=$((total / 100))
+            if [[ $tolerance -lt 1024 ]]; then
+                tolerance=1024  # 最小容差1MB
             fi
-            
-            # 最终安全检查
-            if [[ $used -lt 0 ]]; then
-                used=0
-                free=$total
+
+            if [[ ${diff#-} -gt $tolerance ]]; then
+                # 数据不一致，优先保证total的准确性
+                if [[ $free -gt $total ]]; then
+                    # free过大，重置为total
+                    free=$total
+                    used=0
+                elif [[ $used -gt $total ]]; then
+                    # used过大，重置
+                    used=$total
+                    free=0
+                else
+                    # 重新计算used，保证一致性
+                    used=$((total - free))
+                fi
+
+                # 最终安全检查
+                if [[ $used -lt 0 ]]; then
+                    used=0
+                    free=$total
+                fi
+                if [[ $free -lt 0 ]]; then
+                    free=0
+                    used=$total
+                fi
             fi
-            if [[ $free -lt 0 ]]; then
-                free=0
-                used=$total
-            fi
+        else
+            # 如果没有获取到数据，设置默认值
+            total=0
+            used=0
+            free=0
         fi
     fi
 
     # 计算使用百分比
     if [[ $total -gt 0 ]]; then
         usage_percent=$(echo "scale=1; $used * 100 / $total" | bc 2>/dev/null || echo "0")
-        usage_percent=$(sanitize_number "$usage_percent" "0")
+        # 确保usage_percent是有效的数字
+        if ! [[ "$usage_percent" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+            usage_percent="0"
+        fi
     else
         usage_percent="0"
     fi
@@ -1194,7 +1185,7 @@ get_disk_usage() {
     fi
 
     # 容器环境特殊处理
-    if [[ "${IS_CONTAINER:-false}" == "true" && "$total" == "0" ]]; then
+    if [[ "${CONTAINER_ENV:-false}" == "true" && "$total" == "0" ]]; then
         # 在容器中，尝试获取当前目录的磁盘使用情况
         if command_exists df; then
             local container_disk=$(df -k . 2>/dev/null | tail -1)
@@ -1494,16 +1485,12 @@ sanitize_integer() {
     [[ "$value" =~ ^[0-9]+$ ]] && echo "$value" || echo "$default_value"
 }
 
-
-
 # 清理JSON字符串
 clean_json_string() {
     local input="$1"
     # 移除可能的控制字符和非打印字符
     echo "$input" | tr -d '\000-\037' | tr -d '\177-\377'
 }
-
-
 
 # 获取服务器配置（带简单重试）
 get_config() {
@@ -1592,8 +1579,6 @@ load_config_cache() {
     fi
     return 1
 }
-
-
 
 # 上报监控数据
 report_metrics() {
@@ -1697,8 +1682,6 @@ report_metrics() {
         esac
     fi
 }
-
-
 
 # 创建监控服务脚本
 create_service_script() {
@@ -1981,8 +1964,6 @@ is_root_user() {
     [[ $EUID -eq 0 ]]
 }
 
-
-
 # 检查systemd服务可用性（根据用户类型）
 check_systemd_availability() {
     if ! command_exists systemctl; then
@@ -2082,8 +2063,6 @@ EOF
     return 0
 }
 
-
-
 # ==================== systemd lingering支持 ====================
 
 # 简化的lingering启用
@@ -2102,8 +2081,6 @@ enable_lingering() {
     loginctl enable-linger "$USER" 2>/dev/null || true
     return 0
 }
-
-
 
 # 启动监控服务
 start_service() {
@@ -2513,8 +2490,6 @@ setup_crontab_autostart() {
     fi
 }
 
-
-
 # 检查crontab自启动状态
 check_crontab_autostart() {
     if ! command_exists crontab; then
@@ -2562,8 +2537,6 @@ EOF
     print_message "$GREEN" "✓ shell profile自启动已配置"
     return 0
 }
-
-
 
 # ==================== 多重自启动方案协调器 ====================
 
@@ -2635,9 +2608,6 @@ setup_auto_start() {
     return 0
 }
 
-
-
-
 # 查看日志
 view_logs() {
     if [[ ! -f "$LOG_FILE" ]]; then
@@ -2651,7 +2621,6 @@ view_logs() {
     echo "----------------------------------------"
     print_message "$CYAN" "日志文件位置: $LOG_FILE"
 }
-
 
 # 测试连接
 test_connection() {
@@ -2681,12 +2650,6 @@ test_connection() {
 
     print_message "$GREEN" "✓ 连接测试完成"
 }
-
-
-
-
-
-
 
 # 配置监控参数
 configure_monitor() {
@@ -2827,8 +2790,6 @@ install_monitor() {
         error_exit "服务启动失败"
     fi
 }
-
-
 
 # 集中式彻底卸载监控服务
 uninstall_monitor() {
@@ -3124,7 +3085,6 @@ one_click_install() {
     local server_id="$1"
     local api_key="$2"
     local worker_url="$3"
-
 
     print_message "$BLUE" "开始一键安装VPS监控服务..."
     echo
