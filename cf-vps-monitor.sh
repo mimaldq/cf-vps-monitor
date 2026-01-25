@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # cf-vps-monitor - Cloudflare Worker VPS监控脚本
-# 版本: 2.0.1
-# 修复HTTP 400错误版本
+# 版本: 2.0.2
+# 修复FreeBSD内存和负载平均值问题
 
 set -euo pipefail
 
@@ -264,55 +264,39 @@ EOF
     print_message "$GREEN" "配置已保存到 $CONFIG_FILE"
 }
 
-# ==================== 简化的系统信息获取 ====================
+# ==================== FreeBSD优化的系统信息获取 ====================
 
-# 获取CPU使用率（简化版）
-get_cpu_usage_simple() {
+# 移除内存值的单位（FreeBSD特定）
+remove_memory_unit() {
+    local value="$1"
+    # 移除所有非数字字符，只保留数字
+    echo "$value" | sed 's/[^0-9]//g'
+}
+
+# 获取CPU使用率（FreeBSD优化版）
+get_cpu_usage_freebsd() {
     local cpu_usage=0
     local load1=0 load5=0 load15=0
     
-    if [[ "$OS" == "FreeBSD" ]]; then
-        # FreeBSD: 使用top命令
+    # FreeBSD: 使用sysctl获取负载平均值
+    if command_exists sysctl; then
+        local load_output=$(sysctl -n vm.loadavg 2>/dev/null)
+        # 格式: { 1.05 1.20 1.15 } 或 1.05 1.20 1.15
+        load_output=$(echo "$load_output" | tr -d '{}')
+        local load_array=($load_output)
+        
+        if [[ ${#load_array[@]} -ge 3 ]]; then
+            load1=${load_array[0]}
+            load5=${load_array[1]}
+            load15=${load_array[2]}
+        fi
+        
+        # 使用top获取CPU使用率
         if command_exists top; then
-            local top_output=$(top -b -n 1 2>/dev/null | head -5)
+            local top_output=$(top -b -d 1 2>/dev/null | head -10)
             if [[ "$top_output" =~ ([0-9.]+)%[[:space:]]*id ]]; then
                 local idle_percent="${BASH_REMATCH[1]}"
                 cpu_usage=$(echo "100 - $idle_percent" | bc 2>/dev/null || echo "0")
-            fi
-            
-            # 获取负载
-            if command_exists sysctl; then
-                local load_output=$(sysctl -n vm.loadavg 2>/dev/null)
-                load1=$(echo "$load_output" | awk '{print $2}' 2>/dev/null || echo "0")
-                load5=$(echo "$load_output" | awk '{print $3}' 2>/dev/null || echo "0")
-                load15=$(echo "$load_output" | awk '{print $4}' 2>/dev/null || echo "0")
-            fi
-        fi
-    else
-        # Linux: 使用/proc/loadavg和/proc/stat
-        if [[ -f /proc/loadavg ]]; then
-            local load_data=$(cat /proc/loadavg 2>/dev/null)
-            load1=$(echo "$load_data" | awk '{print $1}' 2>/dev/null || echo "0")
-            load5=$(echo "$load_data" | awk '{print $2}' 2>/dev/null || echo "0")
-            load15=$(echo "$load_data" | awk '{print $3}' 2>/dev/null || echo "0")
-        fi
-        
-        # 计算CPU使用率
-        if [[ -f /proc/stat ]]; then
-            local cpu_line=$(head -n1 /proc/stat 2>/dev/null)
-            if [[ -n "$cpu_line" ]]; then
-                local cpu_times=($cpu_line)
-                if [[ ${#cpu_times[@]} -ge 5 ]]; then
-                    local user=${cpu_times[1]}
-                    local nice=${cpu_times[2]}
-                    local system=${cpu_times[3]}
-                    local idle=${cpu_times[4]}
-                    local total=$((user + nice + system + idle))
-                    
-                    if [[ $total -gt 0 ]]; then
-                        cpu_usage=$((100 - (idle * 100 / total)))
-                    fi
-                fi
             fi
         fi
     fi
@@ -323,29 +307,21 @@ get_cpu_usage_simple() {
     echo "{\"usage_percent\":$cpu_usage,\"load_avg\":[$load1,$load5,$load15]}"
 }
 
-# 获取内存使用情况（简化版）
-get_memory_usage_simple() {
+# 获取内存使用情况（FreeBSD优化版）
+get_memory_usage_freebsd() {
     local total=0 used=0 free=0 usage_percent=0
     
-    if [[ "$OS" == "FreeBSD" ]]; then
-        if command_exists top; then
-            local mem_info=$(top -b -n 1 2>/dev/null | grep "^Mem:")
-            if [[ -n "$mem_info" ]]; then
-                total=$(echo "$mem_info" | awk '{print $2}' | sed 's/K//' 2>/dev/null || echo "0")
-                used=$(echo "$mem_info" | awk '{print $4}' | sed 's/K//' 2>/dev/null || echo "0")
-                free=$(echo "$mem_info" | awk '{print $6}' | sed 's/K//' 2>/dev/null || echo "0")
-            fi
-        fi
-    else
-        # Linux: 使用free命令
-        if command_exists free; then
-            local mem_info=$(free -k 2>/dev/null | grep "^Mem:")
-            if [[ -n "$mem_info" ]]; then
-                total=$(echo "$mem_info" | awk '{print $2}' 2>/dev/null || echo "0")
-                used=$(echo "$mem_info" | awk '{print $3}' 2>/dev/null || echo "0")
-                free=$(echo "$mem_info" | awk '{print $4}' 2>/dev/null || echo "0")
-            fi
-        fi
+    if command_exists sysctl; then
+        # FreeBSD: 使用sysctl获取内存信息
+        local pagesize=$(sysctl -n hw.pagesize 2>/dev/null || echo "4096")
+        local total_pages=$(sysctl -n vm.stats.vm.v_page_count 2>/dev/null || echo "0")
+        local free_pages=$(sysctl -n vm.stats.vm.v_free_count 2>/dev/null || echo "0")
+        local inactive_pages=$(sysctl -n vm.stats.vm.v_inactive_count 2>/dev/null || echo "0")
+        
+        # 转换为KB
+        total=$(( (total_pages * pagesize) / 1024 ))
+        free=$(( ((free_pages + inactive_pages) * pagesize) / 1024 ))
+        used=$((total - free))
     fi
     
     # 计算百分比
@@ -353,19 +329,24 @@ get_memory_usage_simple() {
         usage_percent=$((used * 100 / total))
     fi
     
+    # 确保数值合理
+    [[ $used -lt 0 ]] && used=0
+    [[ $free -lt 0 ]] && free=0
+    [[ $used -gt $total ]] && used=$total && free=0
+    
     echo "{\"total\":$total,\"used\":$used,\"free\":$free,\"usage_percent\":$usage_percent}"
 }
 
-# 获取磁盘使用情况（简化版）
-get_disk_usage_simple() {
+# 获取磁盘使用情况（通用版）
+get_disk_usage() {
     local total=0 used=0 free=0 usage_percent=0
     
     if command_exists df; then
         local disk_info=$(df -k / 2>/dev/null | tail -1)
         if [[ -n "$disk_info" ]]; then
-            total=$(echo "$disk_info" | awk '{printf "%.2f", $2 / 1024 / 1024}' 2>/dev/null || echo "0")
-            used=$(echo "$disk_info" | awk '{printf "%.2f", $3 / 1024 / 1024}' 2>/dev/null || echo "0")
-            free=$(echo "$disk_info" | awk '{printf "%.2f", $4 / 1024 / 1024}' 2>/dev/null || echo "0")
+            total=$(echo "$disk_info" | awk '{printf "%.0f", $2 / 1024}' 2>/dev/null || echo "0")  # MB
+            used=$(echo "$disk_info" | awk '{printf "%.0f", $3 / 1024}' 2>/dev/null || echo "0")   # MB
+            free=$(echo "$disk_info" | awk '{printf "%.0f", $4 / 1024}' 2>/dev/null || echo "0")   # MB
             usage_percent=$(echo "$disk_info" | awk '{print $5}' | tr -d '%' 2>/dev/null || echo "0")
         fi
     fi
@@ -373,48 +354,53 @@ get_disk_usage_simple() {
     echo "{\"total\":$total,\"used\":$used,\"free\":$free,\"usage_percent\":$usage_percent}"
 }
 
-# 获取系统运行时间（简化版）
-get_uptime_simple() {
+# 获取系统运行时间
+get_uptime() {
     local uptime_seconds=0
     
     if [[ -f /proc/uptime ]]; then
         uptime_seconds=$(cut -d. -f1 /proc/uptime)
-    elif command_exists uptime; then
-        local uptime_str=$(uptime 2>/dev/null | sed -n 's/^.* up \([^,]*\), .*/\1/p')
-        if [[ "$uptime_str" =~ ([0-9]+)\ days? ]]; then
-            uptime_seconds=$((${BASH_REMATCH[1]} * 86400))
+    elif command_exists sysctl && [[ "$OS" == "FreeBSD" ]]; then
+        # FreeBSD: 使用sysctl获取启动时间
+        local boot_time=$(sysctl -n kern.boottime 2>/dev/null | awk '{print $4}' | tr -d ',')
+        local current_time=$(date +%s)
+        if [[ -n "$boot_time" ]] && [[ "$boot_time" =~ ^[0-9]+$ ]]; then
+            uptime_seconds=$((current_time - boot_time))
         fi
     fi
     
     echo "$uptime_seconds"
 }
 
-# ==================== 数据上报（简化版） ====================
+# ==================== 数据上报 ====================
 
 # 简化的数据上报
 report_metrics_simple() {
     local timestamp=$(date +%s)
     
-    # 获取各项数据
-    local cpu_data=$(get_cpu_usage_simple)
-    local memory_data=$(get_memory_usage_simple)
-    local disk_data=$(get_disk_usage_simple)
-    local uptime=$(get_uptime_simple)
+    # 根据系统类型使用不同的获取方法
+    local cpu_data memory_data
     
-    # 构建简单的JSON数据
-    # 注意：移除了network字段，因为可能引起格式问题
+    if [[ "$OS" == "FreeBSD" ]]; then
+        cpu_data=$(get_cpu_usage_freebsd)
+        memory_data=$(get_memory_usage_freebsd)
+    else
+        # Linux系统使用简单方法
+        cpu_data=$(get_cpu_usage_linux)
+        memory_data=$(get_memory_usage_linux)
+    fi
+    
+    local disk_data=$(get_disk_usage)
+    local uptime=$(get_uptime)
+    
+    # 构建JSON数据
     local data="{\"timestamp\":$timestamp,\"cpu\":$cpu_data,\"memory\":$memory_data,\"disk\":$disk_data,\"uptime\":$uptime}"
     
     # 清理API KEY和ID
     local clean_api_key=$(echo "$API_KEY" | tr -d ' \n\r')
     local clean_server_id=$(echo "$SERVER_ID" | tr -d ' \n\r')
     
-    log "正在上报简化数据到 $WORKER_URL/api/report/$clean_server_id"
-    
-    # 调试：打印数据长度和前100个字符
-    local data_length=${#data}
-    log "数据长度: $data_length 字符"
-    log "数据预览: ${data:0:100}..."
+    log "正在上报数据到 $WORKER_URL/api/report/$clean_server_id"
     
     # 发送请求
     local response=$(curl -s -w "%{http_code}" -X POST "$WORKER_URL/api/report/$clean_server_id" \
@@ -435,43 +421,8 @@ report_metrics_simple() {
     fi
 }
 
-# ==================== 服务脚本创建 ====================
-
-# 创建监控服务脚本
-create_service_script() {
-    # 获取当前脚本的绝对路径
-    local main_script_path=$(realpath "$0" 2>/dev/null || echo "$0")
-    
-    cat > "$SERVICE_FILE" << 'EOF'
-#!/bin/bash
-
-# cf-vps-monitor服务脚本 - 简化版
-SCRIPT_DIR="$HOME/.cf-vps-monitor"
-CONFIG_FILE="$SCRIPT_DIR/config/config"
-LOG_FILE="$SCRIPT_DIR/logs/monitor.log"
-PID_FILE="$SCRIPT_DIR/run/monitor.pid"
-
-# 设置服务模式标志
-export SERVICE_MODE=true
-
-# 确保日志目录存在
-mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
-
-# 加载配置
-if [[ -f "$CONFIG_FILE" ]]; then
-    source "$CONFIG_FILE"
-else
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 配置文件不存在: $CONFIG_FILE" >> "$LOG_FILE"
-    exit 1
-fi
-
-# 清理API KEY和ID
-WORKER_URL=$(echo "$WORKER_URL" | tr -d ' \n\r')
-SERVER_ID=$(echo "$SERVER_ID" | tr -d ' \n\r')
-API_KEY=$(echo "$API_KEY" | tr -d ' \n\r')
-
-# 获取CPU使用率
-get_cpu_usage() {
+# Linux系统的简单获取方法
+get_cpu_usage_linux() {
     local cpu_usage=0
     local load1=0 load5=0 load15=0
     
@@ -500,6 +451,115 @@ get_cpu_usage() {
         load15=$(echo "$load_data" | awk '{print $3}' 2>/dev/null || echo "0")
     fi
     
+    echo "{\"usage_percent\":$cpu_usage,\"load_avg\":[$load1,$load5,$load15]}"
+}
+
+# Linux系统的内存获取
+get_memory_usage_linux() {
+    local total=0 used=0 free=0 usage_percent=0
+    
+    if command_exists free; then
+        local mem_info=$(free -k 2>/dev/null | grep "^Mem:")
+        if [[ -n "$mem_info" ]]; then
+            total=$(echo "$mem_info" | awk '{print $2}' 2>/dev/null || echo "0")
+            used=$(echo "$mem_info" | awk '{print $3}' 2>/dev/null || echo "0")
+            free=$(echo "$mem_info" | awk '{print $4}' 2>/dev/null || echo "0")
+        fi
+    fi
+    
+    if [[ $total -gt 0 ]]; then
+        usage_percent=$((used * 100 / total))
+    fi
+    
+    echo "{\"total\":$total,\"used\":$used,\"free\":$free,\"usage_percent\":$usage_percent}"
+}
+
+# ==================== 服务脚本创建 ====================
+
+# 创建监控服务脚本
+create_service_script() {
+    cat > "$SERVICE_FILE" << 'EOF'
+#!/bin/bash
+
+# cf-vps-monitor服务脚本 - FreeBSD优化版
+SCRIPT_DIR="$HOME/.cf-vps-monitor"
+CONFIG_FILE="$SCRIPT_DIR/config/config"
+LOG_FILE="$SCRIPT_DIR/logs/monitor.log"
+PID_FILE="$SCRIPT_DIR/run/monitor.pid"
+
+# 设置服务模式标志
+export SERVICE_MODE=true
+
+# 确保日志目录存在
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+
+# 加载配置
+if [[ -f "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE"
+else
+    echo "$(date '+%Y-%m-%d %H:%M:%S') 配置文件不存在: $CONFIG_FILE" >> "$LOG_FILE"
+    exit 1
+fi
+
+# 清理API KEY和ID
+WORKER_URL=$(echo "$WORKER_URL" | tr -d ' \n\r')
+SERVER_ID=$(echo "$SERVER_ID" | tr -d ' \n\r')
+API_KEY=$(echo "$API_KEY" | tr -d ' \n\r')
+
+# 获取CPU使用率（FreeBSD优化）
+get_cpu_usage() {
+    local cpu_usage=0
+    local load1=0 load5=0 load15=0
+    
+    # FreeBSD: 使用sysctl获取负载平均值
+    if command_exists sysctl; then
+        local load_output=$(sysctl -n vm.loadavg 2>/dev/null)
+        # 清理格式: { 1.05 1.20 1.15 } -> 1.05 1.20 1.15
+        load_output=$(echo "$load_output" | tr -d '{}')
+        local load_array=($load_output)
+        
+        if [[ ${#load_array[@]} -ge 3 ]]; then
+            load1=${load_array[0]}
+            load5=${load_array[1]}
+            load15=${load_array[2]}
+        fi
+        
+        # 使用top获取CPU使用率
+        if command_exists top; then
+            local top_output=$(top -b -d 1 2>/dev/null | head -10)
+            if [[ "$top_output" =~ ([0-9.]+)%[[:space:]]*id ]]; then
+                local idle_percent="${BASH_REMATCH[1]}"
+                cpu_usage=$(echo "100 - $idle_percent" | bc 2>/dev/null || echo "0")
+            fi
+        fi
+    else
+        # Linux系统
+        if [[ -f /proc/stat ]]; then
+            local cpu_line=$(head -n1 /proc/stat 2>/dev/null)
+            if [[ -n "$cpu_line" ]]; then
+                local cpu_times=($cpu_line)
+                if [[ ${#cpu_times[@]} -ge 5 ]]; then
+                    local user=${cpu_times[1]}
+                    local nice=${cpu_times[2]}
+                    local system=${cpu_times[3]}
+                    local idle=${cpu_times[4]}
+                    local total=$((user + nice + system + idle))
+                    
+                    if [[ $total -gt 0 ]]; then
+                        cpu_usage=$((100 - (idle * 100 / total)))
+                    fi
+                fi
+            fi
+        fi
+        
+        if [[ -f /proc/loadavg ]]; then
+            local load_data=$(cat /proc/loadavg 2>/dev/null)
+            load1=$(echo "$load_data" | awk '{print $1}' 2>/dev/null || echo "0")
+            load5=$(echo "$load_data" | awk '{print $2}' 2>/dev/null || echo "0")
+            load15=$(echo "$load_data" | awk '{print $3}' 2>/dev/null || echo "0")
+        fi
+    fi
+    
     # 确保数值在合理范围
     cpu_usage=$((cpu_usage > 100 ? 100 : (cpu_usage < 0 ? 0 : cpu_usage)))
     
@@ -510,12 +570,28 @@ get_cpu_usage() {
 get_memory_usage() {
     local total=0 used=0 free=0 usage_percent=0
     
-    if command_exists free; then
-        local mem_info=$(free -k 2>/dev/null | grep "^Mem:")
-        if [[ -n "$mem_info" ]]; then
-            total=$(echo "$mem_info" | awk '{print $2}' 2>/dev/null || echo "0")
-            used=$(echo "$mem_info" | awk '{print $3}' 2>/dev/null || echo "0")
-            free=$(echo "$mem_info" | awk '{print $4}' 2>/dev/null || echo "0")
+    if [[ $(uname -s) == "FreeBSD" ]]; then
+        # FreeBSD: 使用sysctl
+        if command_exists sysctl; then
+            local pagesize=$(sysctl -n hw.pagesize 2>/dev/null || echo "4096")
+            local total_pages=$(sysctl -n vm.stats.vm.v_page_count 2>/dev/null || echo "0")
+            local free_pages=$(sysctl -n vm.stats.vm.v_free_count 2>/dev/null || echo "0")
+            local inactive_pages=$(sysctl -n vm.stats.vm.v_inactive_count 2>/dev/null || echo "0")
+            
+            # 转换为KB
+            total=$(( (total_pages * pagesize) / 1024 ))
+            free=$(( ((free_pages + inactive_pages) * pagesize) / 1024 ))
+            used=$((total - free))
+        fi
+    else
+        # Linux: 使用free命令
+        if command_exists free; then
+            local mem_info=$(free -k 2>/dev/null | grep "^Mem:")
+            if [[ -n "$mem_info" ]]; then
+                total=$(echo "$mem_info" | awk '{print $2}' 2>/dev/null || echo "0")
+                used=$(echo "$mem_info" | awk '{print $3}' 2>/dev/null || echo "0")
+                free=$(echo "$mem_info" | awk '{print $4}' 2>/dev/null || echo "0")
+            fi
         fi
     fi
     
@@ -534,9 +610,9 @@ get_disk_usage() {
     if command_exists df; then
         local disk_info=$(df -k / 2>/dev/null | tail -1)
         if [[ -n "$disk_info" ]]; then
-            total=$(echo "$disk_info" | awk '{printf "%.2f", $2 / 1024 / 1024}' 2>/dev/null || echo "0")
-            used=$(echo "$disk_info" | awk '{printf "%.2f", $3 / 1024 / 1024}' 2>/dev/null || echo "0")
-            free=$(echo "$disk_info" | awk '{printf "%.2f", $4 / 1024 / 1024}' 2>/dev/null || echo "0")
+            total=$(echo "$disk_info" | awk '{printf "%.0f", $2 / 1024}' 2>/dev/null || echo "0")
+            used=$(echo "$disk_info" | awk '{printf "%.0f", $3 / 1024}' 2>/dev/null || echo "0")
+            free=$(echo "$disk_info" | awk '{printf "%.0f", $4 / 1024}' 2>/dev/null || echo "0")
             usage_percent=$(echo "$disk_info" | awk '{print $5}' | tr -d '%' 2>/dev/null || echo "0")
         fi
     fi
@@ -547,9 +623,17 @@ get_disk_usage() {
 # 获取系统运行时间
 get_uptime() {
     local uptime_seconds=0
+    
     if [[ -f /proc/uptime ]]; then
         uptime_seconds=$(cut -d. -f1 /proc/uptime)
+    elif command_exists sysctl && [[ $(uname -s) == "FreeBSD" ]]; then
+        local boot_time=$(sysctl -n kern.boottime 2>/dev/null | awk '{print $4}' | tr -d ',')
+        local current_time=$(date +%s)
+        if [[ -n "$boot_time" ]] && [[ "$boot_time" =~ ^[0-9]+$ ]]; then
+            uptime_seconds=$((current_time - boot_time))
+        fi
     fi
+    
     echo "$uptime_seconds"
 }
 
@@ -563,7 +647,7 @@ report_metrics() {
     local disk_data=$(get_disk_usage)
     local uptime=$(get_uptime)
     
-    # 构建JSON数据 - 简化的格式
+    # 构建JSON数据
     local data="{\"timestamp\":$timestamp,\"cpu\":$cpu_data,\"memory\":$memory_data,\"disk\":$disk_data,\"uptime\":$uptime}"
     
     echo "$(date '+%Y-%m-%d %H:%M:%S') 正在上报数据到 $WORKER_URL/api/report/$SERVER_ID" >> "$LOG_FILE"
@@ -587,7 +671,7 @@ report_metrics() {
 
 # 主循环
 main() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') VPS监控服务启动 (PID: $$)" >> "$LOG_FILE"
+    echo "$(date '+%Y-%m-d %H:%M:%S') VPS监控服务启动 (PID: $$)" >> "$LOG_FILE"
     echo $$ > "$PID_FILE"
     
     # 信号处理
@@ -957,7 +1041,7 @@ view_logs() {
 
 # 显示帮助信息
 show_help() {
-    echo "VPS监控脚本 v2.0.1"
+    echo "VPS监控脚本 v2.0.2"
     echo
     echo "用法: $0 [选项] [参数]"
     echo
