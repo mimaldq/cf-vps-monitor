@@ -65,162 +65,6 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# ==================== Docker环境检测 ====================
-
-# 检测Docker环境
-detect_docker_env() {
-    local docker_detected=false
-    
-    # 方法1: 检查/.dockerenv文件（最简单的方法）
-    if [[ -f "/.dockerenv" ]]; then
-        docker_detected=true
-        CONTAINER_ENV="true"
-        CONTAINER_TYPE="docker"
-        log "检测到Docker环境 (/.dockerenv)"
-    fi
-    
-    # 方法2: 检查cgroup中的docker信息
-    if [[ "$docker_detected" == "false" && -f "/proc/1/cgroup" ]]; then
-        if grep -q "docker\|lxc" /proc/1/cgroup 2>/dev/null; then
-            docker_detected=true
-            CONTAINER_ENV="true"
-            CONTAINER_TYPE="docker"
-            log "检测到Docker环境 (cgroup检测)"
-        fi
-    fi
-    
-    # 方法3: 检查容器环境变量
-    if [[ "$docker_detected" == "false" ]]; then
-        if [[ -n "${container:-}" ]]; then
-            docker_detected=true
-            CONTAINER_ENV="true"
-            CONTAINER_TYPE="${container}"
-            log "检测到容器环境 (环境变量: ${container})"
-        fi
-    fi
-    
-    # 方法4: 检查Kubernetes环境
-    if [[ "$docker_detected" == "false" ]]; then
-        if [[ -n "${KUBERNETES_SERVICE_HOST:-}" ]]; then
-            docker_detected=true
-            CONTAINER_ENV="true"
-            CONTAINER_TYPE="kubernetes"
-            log "检测到Kubernetes环境"
-        fi
-    fi
-    
-    # 设置环境变量
-    if [[ "$docker_detected" == "true" ]]; then
-        export CONTAINER_ENV CONTAINER_TYPE
-        print_message "$GREEN" "检测到容器环境: ${CONTAINER_TYPE}"
-        return 0
-    else
-        CONTAINER_ENV="false"
-        CONTAINER_TYPE="none"
-        export CONTAINER_ENV CONTAINER_TYPE
-        return 1
-    fi
-}
-
-# ==================== JSON数据处理 ====================
-
-# 清理JSON特殊字符（安全版本）
-clean_json_string() {
-    local input="$1"
-    
-    if [[ -z "$input" ]]; then
-        echo ""
-        return
-    fi
-    
-    # 移除所有控制字符（ASCII 0-31，127）
-    input=$(echo "$input" | tr -d '\000-\031' | tr -d '\177')
-    
-    # 转义特殊JSON字符
-    input=$(echo "$input" | sed 's/\\/\\\\/g')  # 反斜杠
-    input=$(echo "$input" | sed 's/"/\\"/g')    # 双引号
-    input=$(echo "$input" | sed 's/\//\\\//g')  # 正斜杠
-    input=$(echo "$input" | sed 's/\x08/\\b/g') # 退格
-    input=$(echo "$input" | sed 's/\x0C/\\f/g') # 换页
-    input=$(echo "$input" | sed 's/\x0A/\\n/g') # 换行
-    input=$(echo "$input" | sed 's/\x0D/\\r/g') # 回车
-    input=$(echo "$input" | sed 's/\x09/\\t/g') # 制表符
-    
-    echo "$input"
-}
-
-# 验证JSON格式
-validate_json() {
-    local json="$1"
-    
-    if [[ -z "$json" ]]; then
-        return 1
-    fi
-    
-    # 简单验证JSON结构（不依赖jq）
-    if [[ "$json" =~ ^\{.*\}$ ]]; then
-        # 检查是否有未闭合的引号
-        local quote_count=$(echo "$json" | tr -cd '"' | wc -c)
-        if [[ $((quote_count % 2)) -eq 0 ]]; then
-            # 检查是否有未转义的控制字符
-            if ! echo "$json" | grep -q $'[\x00-\x1F\x7F]'; then
-                return 0
-            fi
-        fi
-    fi
-    
-    return 1
-}
-
-# 构建安全的JSON数据
-build_safe_json() {
-    local timestamp="$1"
-    local cpu_raw="$2"
-    local memory_raw="$3"
-    local disk_raw="$4"
-    local network_raw="$5"
-    local uptime_raw="$6"
-    
-    # 清理所有输入数据
-    timestamp=$(sanitize_integer "$timestamp" "0")
-    uptime_raw=$(sanitize_integer "$uptime_raw" "0")
-    
-    # 验证各个JSON组件
-    if ! validate_json "$cpu_raw"; then
-        log "警告: CPU数据格式无效，使用默认值"
-        cpu_raw='{"usage_percent":0,"load_avg":[0,0,0]}'
-    fi
-    
-    if ! validate_json "$memory_raw"; then
-        log "警告: 内存数据格式无效，使用默认值"
-        memory_raw='{"total":0,"used":0,"free":0,"usage_percent":0}'
-    fi
-    
-    if ! validate_json "$disk_raw"; then
-        log "警告: 磁盘数据格式无效，使用默认值"
-        disk_raw='{"total":0,"used":0,"free":0,"usage_percent":0}'
-    fi
-    
-    if ! validate_json "$network_raw"; then
-        log "警告: 网络数据格式无效，使用默认值"
-        network_raw='{"upload_speed":0,"download_speed":0,"total_upload":0,"total_download":0}'
-    fi
-    
-    # 构建最终JSON（直接构造，避免复杂处理）
-    local data="{\"timestamp\":$timestamp,\"cpu\":$cpu_raw,\"memory\":$memory_raw,\"disk\":$disk_raw,\"network\":$network_raw,\"uptime\":$uptime_raw,\"container\":{\"is_container\":${CONTAINER_ENV:-false},\"container_type\":\"${CONTAINER_TYPE:-none}\"}}"
-    
-    # 最终验证
-    if validate_json "$data"; then
-        echo "$data"
-        return 0
-    else
-        # 如果仍然无效，使用最简化的版本
-        log "错误: JSON构建失败，使用简化数据"
-        echo '{"timestamp":0,"cpu":{"usage_percent":0,"load_avg":[0,0,0]},"memory":{"total":0,"used":0,"free":0,"usage_percent":0},"disk":{"total":0,"used":0,"free":0,"usage_percent":0},"network":{"upload_speed":0,"download_speed":0,"total_upload":0,"total_download":0},"uptime":0,"container":{"is_container":false,"container_type":"none"}}'
-        return 1
-    fi
-}
-
 # ==================== 系统兼容性层 ====================
 
 # 检测systemd可用性
@@ -623,14 +467,46 @@ execute_system_command() {
     esac
 }
 
+# 增强的容器检测函数
+detect_container_environment() {
+    local container_type="none"
+    local is_container="false"
+    
+    # 多种方式检测容器环境
+    if [[ -f /.dockerenv ]]; then
+        container_type="docker"
+        is_container="true"
+    elif [[ -f /run/.containerenv ]]; then
+        container_type="podman"
+        is_container="true"
+    elif [[ -f /proc/1/cgroup ]]; then
+        # 检查cgroup中是否包含容器标识
+        if grep -q "docker\|lxc\|kubepods\|containerd" /proc/1/cgroup 2>/dev/null; then
+            if grep -q "docker" /proc/1/cgroup 2>/dev/null; then
+                container_type="docker"
+            elif grep -q "lxc" /proc/1/cgroup 2>/dev/null; then
+                container_type="lxc"
+            elif grep -q "kubepods" /proc/1/cgroup 2>/dev/null; then
+                container_type="kubernetes"
+            else
+                container_type="container"
+            fi
+            is_container="true"
+        fi
+    fi
+    
+    echo "$is_container:$container_type"
+}
+
 # 检测系统信息（优化版 - 减少fork操作）
 detect_system() {
-    # 检测Docker环境
-    detect_docker_env
-    
     # 一次性获取系统基本信息（减少fork）
     local system_info=$(uname -srm)
     IFS=' ' read -r OS KERNEL_VERSION ARCH <<< "$system_info"
+
+    # 检测容器环境
+    local container_info=$(detect_container_environment)
+    IFS=':' read -r IS_CONTAINER CONTAINER_TYPE <<< "$container_info"
 
     # FreeBSD特殊优化（避免不必要的检测）
     if [[ "$OS" == "FreeBSD" ]]; then
@@ -662,11 +538,14 @@ detect_system() {
         fi
 
         print_message "$GREEN" "检测到系统: $DISTRO_NAME $VER"
+        if [[ "$IS_CONTAINER" == "true" ]]; then
+            print_message "$CYAN" "容器环境: $CONTAINER_TYPE"
+        fi
     fi
 
     # 确保变量在全局可用
     export OS ARCH KERNEL_VERSION VER DISTRO_ID DISTRO_NAME
-    export VIRTUALIZATION
+    export IS_CONTAINER CONTAINER_TYPE VIRTUALIZATION
 }
 
 # 检测包管理器（增强版）
@@ -902,6 +781,10 @@ install_dependencies() {
     print_message "$GREEN" "依赖检查完成"
 }
 
+
+
+
+
 # 创建集中式目录结构
 create_directories() {
     print_message "$BLUE" "创建集中式目录结构..."
@@ -1134,161 +1017,141 @@ get_memory_usage() {
             free=0
         fi
     else
-        # Linux系统 - 修复内存计算逻辑，确保 used + free = total
+        # Linux系统 - 改进的内存计算逻辑
         total=0
         used=0
         free=0
 
-        # 方法1: 使用free命令（最常用且最准确）
-        if command_exists free; then
-            local mem_info=$(free -k 2>/dev/null | grep "^Mem:")
-            if [[ -n "$mem_info" ]]; then
-                total=$(echo "$mem_info" | awk '{print $2}')
+        # 使用增强的容器检测
+        local is_container="$IS_CONTAINER"
 
-                # 尝试获取available列（第7列，现代Linux系统）
-                local available=$(echo "$mem_info" | awk '{print $7}' 2>/dev/null || echo "")
-                if [[ "$available" =~ ^[0-9]+$ ]]; then
-                    # 如果有available列，使用它作为真正的可用内存
-                    free=$available
-                    used=$((total - free))
-                else
-                    # 如果没有available列，使用传统方法计算
-                    local mem_free=$(echo "$mem_info" | awk '{print $4}' 2>/dev/null || echo "0")
-                    local buff_cache=$(echo "$mem_info" | awk '{print $6}' 2>/dev/null || echo "0")
+        # 方法1: 检查cgroup限制（容器环境优先）
+        local cgroup_limit_kb=""
+        local cgroup_usage_kb=""
+        
+        # 检测Cgroup V2
+        if [[ -f /sys/fs/cgroup/memory.max ]]; then
+            local max_raw=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
+            if [[ "$max_raw" != "max" && "$max_raw" =~ ^[0-9]+$ ]]; then
+                cgroup_limit_kb=$((max_raw / 1024))
+                if [[ -f /sys/fs/cgroup/memory.current ]]; then
+                    cgroup_usage_kb=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo "0")
+                    cgroup_usage_kb=$((cgroup_usage_kb / 1024))
+                fi
+            fi
+        fi
+        
+        # 检测Cgroup V1
+        if [[ -z "$cgroup_limit_kb" && -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
+            local limit_raw=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo "0")
+            # 忽略极大的值（未限制情况）
+            if [[ "$limit_raw" =~ ^[0-9]+$ && "$limit_raw" -lt 9223372036854771712 ]]; then
+                cgroup_limit_kb=$((limit_raw / 1024))
+                cgroup_usage_kb=$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null || echo "0")
+                cgroup_usage_kb=$((cgroup_usage_kb / 1024))
+            fi
+        fi
 
-                    # 验证数据有效性
-                    if [[ "$mem_free" =~ ^[0-9]+$ ]] && [[ "$buff_cache" =~ ^[0-9]+$ ]]; then
-                        free=$((mem_free + buff_cache))
+        # 如果在容器中找到了cgroup限制，优先使用它
+        if [[ "$is_container" == "true" && -n "$cgroup_limit_kb" && "$cgroup_limit_kb" -gt 0 ]]; then
+            total=$cgroup_limit_kb
+            used=$cgroup_usage_kb
+            free=$((total - used))
+            
+            # 验证容器内存数据
+            if [[ $used -lt 0 ]]; then
+                used=0
+            fi
+            if [[ $free -lt 0 ]]; then
+                free=0
+            fi
+            if [[ $total -gt 0 && $used -gt $total ]]; then
+                used=$total
+                free=0
+            fi
+            
+            # 如果cgroup数据无效，回退到free命令
+            if [[ $total -eq 0 ]]; then
+                is_container="false"
+            else
+                # 在容器环境中，我们优先信任cgroup数据
+                :
+            fi
+        fi
+
+        # 方法2: 如果不在容器中或cgroup数据不可用，使用传统方法
+        if [[ "$is_container" == "false" || $total -eq 0 ]]; then
+            if command_exists free; then
+                local mem_info=$(free -k 2>/dev/null | grep "^Mem:")
+                if [[ -n "$mem_info" ]]; then
+                    total=$(echo "$mem_info" | awk '{print $2}')
+                    
+                    # 现代系统有available列
+                    local available=$(echo "$mem_info" | awk '{print $7}' 2>/dev/null || echo "")
+                    if [[ "$available" =~ ^[0-9]+$ ]]; then
+                        free=$available
                         used=$((total - free))
                     else
-                        # 如果解析失败，使用第3列作为used，但需要重新计算free
-                        local raw_used=$(echo "$mem_info" | awk '{print $3}' 2>/dev/null || echo "0")
-                        if [[ "$raw_used" =~ ^[0-9]+$ ]]; then
-                            used=$raw_used
-                            free=$((total - used))
+                        # 传统方法
+                        local mem_free=$(echo "$mem_info" | awk '{print $4}' 2>/dev/null || echo "0")
+                        local buff_cache=$(echo "$mem_info" | awk '{print $6}' 2>/dev/null || echo "0")
+                        
+                        if [[ "$mem_free" =~ ^[0-9]+$ ]] && [[ "$buff_cache" =~ ^[0-9]+$ ]]; then
+                            free=$((mem_free + buff_cache))
+                            used=$((total - free))
+                        else
+                            local raw_used=$(echo "$mem_info" | awk '{print $3}' 2>/dev/null || echo "0")
+                            if [[ "$raw_used" =~ ^[0-9]+$ ]]; then
+                                used=$raw_used
+                                free=$((total - used))
+                            fi
                         fi
                     fi
                 fi
             fi
-        fi
-
-        # 方法2: 直接读取/proc/meminfo（备用方法）
-        if [[ "$total" == "0" ]] && [[ -f /proc/meminfo ]]; then
-            total=$(grep "^MemTotal:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
-            local mem_free=$(grep "^MemFree:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
-            local buffers=$(grep "^Buffers:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
-            local cached=$(grep "^Cached:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
-            local sreclaimable=$(grep "^SReclaimable:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
-
-            # 计算实际可用内存（包括可回收的内存）
-            free=$((mem_free + buffers + cached + sreclaimable))
-            used=$((total - free))
-        fi
-
-        # 方法3: 容器环境特殊处理 (Cgroup V1 & V2)
-        local cgroup_limit="0"
-        local cgroup_usage="0"
-        local cgroup_found=false
-        
-        # 尝试检测 Cgroup V2
-        if [[ -f /sys/fs/cgroup/memory.max ]]; then
-            local max_raw=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
-            if [[ "$max_raw" != "max" && "$max_raw" =~ ^[0-9]+$ ]]; then
-                cgroup_limit="$max_raw"
-                if [[ -f /sys/fs/cgroup/memory.current ]]; then
-                    cgroup_usage=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo "0")
-                    cgroup_found=true
-                fi
-            fi
-        fi
-        
-        # 尝试检测 Cgroup V1 (如果V2没找到)
-        if [[ "$cgroup_found" == "false" && -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
-            local limit_raw=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo "0")
-            # 忽略极大的值 (未限制)
-            if [[ "$limit_raw" =~ ^[0-9]+$ && "$limit_raw" -lt 9223372036854771712 ]]; then
-                cgroup_limit="$limit_raw"
-                cgroup_usage=$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null || echo "0")
-                cgroup_found=true
-            fi
-        fi
-        
-        # 如果找到了有效的cgroup限制，并且限制值小于宿主机物理内存(total)，则使用cgroup数据
-        # 或者如果total是0（上面获取失败），直接使用cgroup数据
-        if [[ "$cgroup_found" == "true" ]]; then
-            local cgroup_total_kb=$((cgroup_limit / 1024))
             
-            # 只有当cgroup限制明显即使有效（例如小于宿主机内存，或者我们确定是在容器里）时才使用
-            # 这里如果不确定宿主机内存，或者cgroup限制小于宿主机内存，就采用
-            if [[ "$total" == "0" || "$cgroup_total_kb" -lt "$total" ]]; then
-                total=$cgroup_total_kb
-                used=$((cgroup_usage / 1024))
-                free=$((total - used))
+            # 方法3: 读取/proc/meminfo（备用）
+            if [[ "$total" == "0" ]] && [[ -f /proc/meminfo ]]; then
+                total=$(grep "^MemTotal:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
+                local mem_free=$(grep "^MemFree:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
+                local buffers=$(grep "^Buffers:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
+                local cached=$(grep "^Cached:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
+                local sreclaimable=$(grep "^SReclaimable:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
+                
+                free=$((mem_free + buffers + cached + sreclaimable))
+                used=$((total - free))
             fi
         fi
 
-        # 确保所有值都是有效数字
+        # 数据验证和修正
         total=$(sanitize_integer "$total" "0")
         used=$(sanitize_integer "$used" "0")
         free=$(sanitize_integer "$free" "0")
 
-        # 数据一致性验证和修正 - 优化版本
         if [[ $total -gt 0 ]]; then
-            # 确保所有值都是有效数字
-            total=$(sanitize_integer "$total" "0")
-            used=$(sanitize_integer "$used" "0")
-            free=$(sanitize_integer "$free" "0")
-
-            # 确保 used + free = total 的一致性
+            # 确保 used + free = total
             local sum=$((used + free))
-            local diff=$((sum - total))
-
-            # 如果差异超过1%，说明数据有问题，需要修正
-            local tolerance=$((total / 100))
-            if [[ $tolerance -lt 1024 ]]; then
-                tolerance=1024  # 最小容差1MB
+            if [[ $sum -ne $total ]]; then
+                # 重新计算used，保证一致性
+                used=$((total - free))
             fi
-
-            if [[ ${diff#-} -gt $tolerance ]]; then
-                # 数据不一致，优先保证total的准确性
-                if [[ $free -gt $total ]]; then
-                    # free过大，重置为total
-                    free=$total
-                    used=0
-                elif [[ $used -gt $total ]]; then
-                    # used过大，重置
-                    used=$total
-                    free=0
-                else
-                    # 重新计算used，保证一致性
-                    used=$((total - free))
-                fi
-
-                # 最终安全检查
-                if [[ $used -lt 0 ]]; then
-                    used=0
-                    free=$total
-                fi
-                if [[ $free -lt 0 ]]; then
-                    free=0
-                    used=$total
-                fi
+            
+            # 最终安全检查
+            if [[ $used -lt 0 ]]; then
+                used=0
+                free=$total
             fi
-        else
-            # 如果没有获取到数据，设置默认值
-            total=0
-            used=0
-            free=0
+            if [[ $free -lt 0 ]]; then
+                free=0
+                used=$total
+            fi
         fi
     fi
 
     # 计算使用百分比
     if [[ $total -gt 0 ]]; then
         usage_percent=$(echo "scale=1; $used * 100 / $total" | bc 2>/dev/null || echo "0")
-        # 确保usage_percent是有效的数字
-        if ! [[ "$usage_percent" =~ ^[0-9]+\.?[0-9]*$ ]]; then
-            usage_percent="0"
-        fi
+        usage_percent=$(sanitize_number "$usage_percent" "0")
     else
         usage_percent="0"
     fi
@@ -1331,7 +1194,7 @@ get_disk_usage() {
     fi
 
     # 容器环境特殊处理
-    if [[ "${CONTAINER_ENV:-false}" == "true" && "$total" == "0" ]]; then
+    if [[ "${IS_CONTAINER:-false}" == "true" && "$total" == "0" ]]; then
         # 在容器中，尝试获取当前目录的磁盘使用情况
         if command_exists df; then
             local container_disk=$(df -k . 2>/dev/null | tail -1)
@@ -1631,102 +1494,16 @@ sanitize_integer() {
     [[ "$value" =~ ^[0-9]+$ ]] && echo "$value" || echo "$default_value"
 }
 
+
+
 # 清理JSON字符串
 clean_json_string() {
     local input="$1"
-    
-    if [[ -z "$input" ]]; then
-        echo ""
-        return
-    fi
-    
-    # 移除所有控制字符（ASCII 0-31，127）
-    input=$(echo "$input" | tr -d '\000-\031' | tr -d '\177')
-    
-    # 转义特殊JSON字符
-    input=$(echo "$input" | sed 's/\\/\\\\/g')  # 反斜杠
-    input=$(echo "$input" | sed 's/"/\\"/g')    # 双引号
-    input=$(echo "$input" | sed 's/\//\\\//g')  # 正斜杠
-    input=$(echo "$input" | sed 's/\x08/\\b/g') # 退格
-    input=$(echo "$input" | sed 's/\x0C/\\f/g') # 换页
-    input=$(echo "$input" | sed 's/\x0A/\\n/g') # 换行
-    input=$(echo "$input" | sed 's/\x0D/\\r/g') # 回车
-    input=$(echo "$input" | sed 's/\x09/\\t/g') # 制表符
-    
-    echo "$input"
+    # 移除可能的控制字符和非打印字符
+    echo "$input" | tr -d '\000-\037' | tr -d '\177-\377'
 }
 
-# 验证JSON格式
-validate_json() {
-    local json="$1"
-    
-    if [[ -z "$json" ]]; then
-        return 1
-    fi
-    
-    # 简单验证JSON结构（不依赖jq）
-    if [[ "$json" =~ ^\{.*\}$ ]]; then
-        # 检查是否有未闭合的引号
-        local quote_count=$(echo "$json" | tr -cd '"' | wc -c)
-        if [[ $((quote_count % 2)) -eq 0 ]]; then
-            # 检查是否有未转义的控制字符
-            if ! echo "$json" | grep -q $'[\x00-\x1F\x7F]'; then
-                return 0
-            fi
-        fi
-    fi
-    
-    return 1
-}
 
-# 构建安全的JSON数据
-build_safe_json() {
-    local timestamp="$1"
-    local cpu_raw="$2"
-    local memory_raw="$3"
-    local disk_raw="$4"
-    local network_raw="$5"
-    local uptime_raw="$6"
-    
-    # 清理所有输入数据
-    timestamp=$(sanitize_integer "$timestamp" "0")
-    uptime_raw=$(sanitize_integer "$uptime_raw" "0")
-    
-    # 验证各个JSON组件
-    if ! validate_json "$cpu_raw"; then
-        log "警告: CPU数据格式无效，使用默认值"
-        cpu_raw='{"usage_percent":0,"load_avg":[0,0,0]}'
-    fi
-    
-    if ! validate_json "$memory_raw"; then
-        log "警告: 内存数据格式无效，使用默认值"
-        memory_raw='{"total":0,"used":0,"free":0,"usage_percent":0}'
-    fi
-    
-    if ! validate_json "$disk_raw"; then
-        log "警告: 磁盘数据格式无效，使用默认值"
-        disk_raw='{"total":0,"used":0,"free":0,"usage_percent":0}'
-    fi
-    
-    if ! validate_json "$network_raw"; then
-        log "警告: 网络数据格式无效，使用默认值"
-        network_raw='{"upload_speed":0,"download_speed":0,"total_upload":0,"total_download":0}'
-    fi
-    
-    # 构建最终JSON（直接构造，避免复杂处理）
-    local data="{\"timestamp\":$timestamp,\"cpu\":$cpu_raw,\"memory\":$memory_raw,\"disk\":$disk_raw,\"network\":$network_raw,\"uptime\":$uptime_raw,\"container\":{\"is_container\":${CONTAINER_ENV:-false},\"container_type\":\"${CONTAINER_TYPE:-none}\"}}"
-    
-    # 最终验证
-    if validate_json "$data"; then
-        echo "$data"
-        return 0
-    else
-        # 如果仍然无效，使用最简化的版本
-        log "错误: JSON构建失败，使用简化数据"
-        echo '{"timestamp":0,"cpu":{"usage_percent":0,"load_avg":[0,0,0]},"memory":{"total":0,"used":0,"free":0,"usage_percent":0},"disk":{"total":0,"used":0,"free":0,"usage_percent":0},"network":{"upload_speed":0,"download_speed":0,"total_upload":0,"total_download":0},"uptime":0,"container":{"is_container":false,"container_type":"none"}}'
-        return 1
-    fi
-}
 
 # 获取服务器配置（带简单重试）
 get_config() {
@@ -1816,7 +1593,9 @@ load_config_cache() {
     return 1
 }
 
-# 上报监控数据（优化版）
+
+
+# 上报监控数据
 report_metrics() {
     local timestamp=$(date +%s)
     local cpu_raw=$(get_cpu_usage)
@@ -1825,9 +1604,24 @@ report_metrics() {
     local network_raw=$(get_network_usage)
     local uptime_raw=$(get_uptime)
 
-    # 使用新的安全JSON构建函数
-    local data=$(build_safe_json "$timestamp" "$cpu_raw" "$memory_raw" "$disk_raw" "$network_raw" "$uptime_raw")
-    
+    # 验证运行时间
+    local uptime=$(sanitize_integer "$uptime_raw" "0")
+
+    # 清理JSON数据
+    cpu_raw=$(clean_json_string "$cpu_raw")
+    memory_raw=$(clean_json_string "$memory_raw")
+    disk_raw=$(clean_json_string "$disk_raw")
+    network_raw=$(clean_json_string "$network_raw")
+
+    # 简单验证JSON格式
+    [[ ! "$cpu_raw" =~ ^\{.*\}$ ]] && cpu_raw='{"usage_percent":0,"load_avg":[0,0,0]}'
+    [[ ! "$memory_raw" =~ ^\{.*\}$ ]] && memory_raw='{"total":0,"used":0,"free":0,"usage_percent":0}'
+    [[ ! "$disk_raw" =~ ^\{.*\}$ ]] && disk_raw='{"total":0,"used":0,"free":0,"usage_percent":0}'
+    [[ ! "$network_raw" =~ ^\{.*\}$ ]] && network_raw='{"upload_speed":0,"download_speed":0,"total_upload":0,"total_download":0}'
+
+    # 构建JSON数据
+    local data="{\"timestamp\":$timestamp,\"cpu\":$cpu_raw,\"memory\":$memory_raw,\"disk\":$disk_raw,\"network\":$network_raw,\"uptime\":$uptime}"
+
     # 确保API KEY和ID没有多余的空格或换行
     local clean_api_key=$(echo "$API_KEY" | tr -d ' \n\r')
     local clean_server_id=$(echo "$SERVER_ID" | tr -d ' \n\r')
@@ -1904,7 +1698,9 @@ report_metrics() {
     fi
 }
 
-# 创建监控服务脚本（更新版）
+
+
+# 创建监控服务脚本
 create_service_script() {
     # 获取当前脚本的绝对路径
     local main_script_path=$(realpath "$0")
@@ -1950,96 +1746,11 @@ source_monitoring_functions() {
 # 加载监控函数
 source_monitoring_functions
 
-# 清理JSON字符串（安全版）
+# 清理JSON字符串
 clean_json_string() {
     local input="\$1"
-    
-    if [[ -z "\$input" ]]; then
-        echo ""
-        return
-    fi
-    
-    # 移除所有控制字符（ASCII 0-31，127）
-    input=\$(echo "\$input" | tr -d '\\000-\\031' | tr -d '\\177')
-    
-    # 转义特殊JSON字符
-    input=\$(echo "\$input" | sed 's/\\\\/\\\\\\\\/g')  # 反斜杠
-    input=\$(echo "\$input" | sed 's/"/\\\\"/g')        # 双引号
-    input=\$(echo "\$input" | sed 's/\\//\\\\\\//g')    # 正斜杠
-    
-    echo "\$input"
-}
-
-# 验证JSON格式
-validate_json() {
-    local json="\$1"
-    
-    if [[ -z "\$json" ]]; then
-        return 1
-    fi
-    
-    # 简单验证JSON结构
-    if [[ "\$json" =~ ^\\{.*\\}\$ ]]; then
-        # 检查是否有未闭合的引号
-        local quote_count=\$(echo "\$json" | tr -cd '"' | wc -c)
-        if [[ \$((quote_count % 2)) -eq 0 ]]; then
-            # 检查是否有未转义的控制字符
-            if ! echo "\$json" | grep -q \$'[\\x00-\\x1F\\x7F]'; then
-                return 0
-            fi
-        fi
-    fi
-    
-    return 1
-}
-
-# 构建安全的JSON数据
-build_safe_json() {
-    local timestamp="\$1"
-    local cpu_raw="\$2"
-    local memory_raw="\$3"
-    local disk_raw="\$4"
-    local network_raw="\$5"
-    local uptime_raw="\$6"
-    
-    # 清理所有输入数据
-    timestamp=\$(sanitize_integer "\$timestamp" "0")
-    uptime_raw=\$(sanitize_integer "\$uptime_raw" "0")
-    
-    # 验证各个JSON组件
-    if ! validate_json "\$cpu_raw"; then
-        log "警告: CPU数据格式无效，使用默认值"
-        cpu_raw='{\\"usage_percent\\":0,\\"load_avg\\":[0,0,0]}'
-    fi
-    
-    if ! validate_json "\$memory_raw"; then
-        log "警告: 内存数据格式无效，使用默认值"
-        memory_raw='{\\"total\\":0,\\"used\\":0,\\"free\\":0,\\"usage_percent\\":0}'
-    fi
-    
-    if ! validate_json "\$disk_raw"; then
-        log "警告: 磁盘数据格式无效，使用默认值"
-        disk_raw='{\\"total\\":0,\\"used\\":0,\\"free\\":0,\\"usage_percent\\":0}'
-    fi
-    
-    if ! validate_json "\$network_raw"; then
-        log "警告: 网络数据格式无效，使用默认值"
-        network_raw='{\\"upload_speed\\":0,\\"download_speed\\":0,\\"total_upload\\":0,\\"total_download\\":0}'
-    fi
-    
-    # 构建最终JSON（直接构造，避免复杂处理）
-    local data="{\\"timestamp\\":\$timestamp,\\"cpu\\":\$cpu_raw,\\"memory\\":\$memory_raw,\\"disk\\":\$disk_raw,\\"network\\":\$network_raw,\\"uptime\\":\$uptime_raw,\\"container\\":{\\"is_container\\":\${CONTAINER_ENV:-false},\\"container_type\\":\\"\${CONTAINER_TYPE:-none}\\"}}"
-    
-    # 最终验证
-    if validate_json "\$data"; then
-        echo "\$data"
-        return 0
-    else
-        # 如果仍然无效，使用最简化的版本
-        log "错误: JSON构建失败，使用简化数据"
-        echo '{\\"timestamp\\":0,\\"cpu\\":{\\"usage_percent\\":0,\\"load_avg\\":[0,0,0]},\\"memory\\":{\\"total\\":0,\\"used\\":0,\\"free\\":0,\\"usage_percent\\":0},\\"disk\\":{\\"total\\":0,\\"used\\":0,\\"free\\":0,\\"usage_percent\\":0},\\"network\\":{\\"upload_speed\\":0,\\"download_speed\\":0,\\"total_upload\\":0,\\"total_download\\":0},\\"uptime\\":0,\\"container\\":{\\"is_container\\":false,\\"container_type\\":\\"none\\"}}'
-        return 1
-    fi
+    # 移除可能的控制字符和非打印字符
+    echo "\$input" | tr -d '\\000-\\037' | tr -d '\\177-\\377'
 }
 
 # 上报监控数据
@@ -2053,8 +1764,32 @@ report_metrics() {
     local network_raw=\$(get_network_usage)
     local uptime_raw=\$(get_uptime)
 
-    # 使用安全JSON构建函数
-    local data=\$(build_safe_json "\$timestamp" "\$cpu_raw" "\$memory_raw" "\$disk_raw" "\$network_raw" "\$uptime_raw")
+    # 验证运行时间
+    local uptime=\$(sanitize_integer "\$uptime_raw" "0")
+
+    # 清理JSON数据
+    cpu_raw=\$(clean_json_string "\$cpu_raw")
+    memory_raw=\$(clean_json_string "\$memory_raw")
+    disk_raw=\$(clean_json_string "\$disk_raw")
+    network_raw=\$(clean_json_string "\$network_raw")
+
+    # 验证各个JSON组件（使用更宽松的验证）
+    if [[ -z "\$cpu_raw" || "\$cpu_raw" == "{}" || ! "\$cpu_raw" =~ ^\{.*\}\$ ]]; then
+        cpu_raw='{\\"usage_percent\\":0,\\"load_avg\\":[0,0,0]}'
+    fi
+    if [[ -z "\$memory_raw" || "\$memory_raw" == "{}" || ! "\$memory_raw" =~ ^\{.*\}\$ ]]; then
+        memory_raw='{\\"total\\":0,\\"used\\":0,\\"free\\":0,\\"usage_percent\\":0}'
+    fi
+    if [[ -z "\$disk_raw" || "\$disk_raw" == "{}" || ! "\$disk_raw" =~ ^\{.*\}\$ ]]; then
+        disk_raw='{\\"total\\":0,\\"used\\":0,\\"free\\":0,\\"usage_percent\\":0}'
+    fi
+    if [[ -z "\$network_raw" || "\$network_raw" == "{}" || ! "\$network_raw" =~ ^\{.*\}\$ ]]; then
+        network_raw='{\\"upload_speed\\":0,\\"download_speed\\":0,\\"total_upload\\":0,\\"total_download\\":0}'
+    fi
+
+
+    # 构建JSON数据
+    local data="{\\"timestamp\\":\$timestamp,\\"cpu\\":\$cpu_raw,\\"memory\\":\$memory_raw,\\"disk\\":\$disk_raw,\\"network\\":\$network_raw,\\"uptime\\":\$uptime}"
 
     # 确保API KEY和ID没有多余的空格或换行
     local clean_api_key=\$(echo "\$API_KEY" | tr -d ' \\n\\r')
@@ -2246,6 +1981,8 @@ is_root_user() {
     [[ $EUID -eq 0 ]]
 }
 
+
+
 # 检查systemd服务可用性（根据用户类型）
 check_systemd_availability() {
     if ! command_exists systemctl; then
@@ -2345,6 +2082,8 @@ EOF
     return 0
 }
 
+
+
 # ==================== systemd lingering支持 ====================
 
 # 简化的lingering启用
@@ -2363,6 +2102,8 @@ enable_lingering() {
     loginctl enable-linger "$USER" 2>/dev/null || true
     return 0
 }
+
+
 
 # 启动监控服务
 start_service() {
@@ -2772,6 +2513,8 @@ setup_crontab_autostart() {
     fi
 }
 
+
+
 # 检查crontab自启动状态
 check_crontab_autostart() {
     if ! command_exists crontab; then
@@ -2819,6 +2562,8 @@ EOF
     print_message "$GREEN" "✓ shell profile自启动已配置"
     return 0
 }
+
+
 
 # ==================== 多重自启动方案协调器 ====================
 
@@ -2890,6 +2635,9 @@ setup_auto_start() {
     return 0
 }
 
+
+
+
 # 查看日志
 view_logs() {
     if [[ ! -f "$LOG_FILE" ]]; then
@@ -2903,6 +2651,7 @@ view_logs() {
     echo "----------------------------------------"
     print_message "$CYAN" "日志文件位置: $LOG_FILE"
 }
+
 
 # 测试连接
 test_connection() {
@@ -2932,6 +2681,12 @@ test_connection() {
 
     print_message "$GREEN" "✓ 连接测试完成"
 }
+
+
+
+
+
+
 
 # 配置监控参数
 configure_monitor() {
@@ -3072,6 +2827,8 @@ install_monitor() {
         error_exit "服务启动失败"
     fi
 }
+
+
 
 # 集中式彻底卸载监控服务
 uninstall_monitor() {
@@ -3367,6 +3124,7 @@ one_click_install() {
     local server_id="$1"
     local api_key="$2"
     local worker_url="$3"
+
 
     print_message "$BLUE" "开始一键安装VPS监控服务..."
     echo
