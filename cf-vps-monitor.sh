@@ -1,13 +1,12 @@
 #!/bin/bash
 
 # cf-vps-monitor - Cloudflare Worker VPS监控脚本
-# 版本: 2.2.0 (FreeBSD修复版)
-# 完全兼容FreeBSD系统
+# 版本: 2.3.0 (数据上报修复版)
 
 set -euo pipefail
 
 # ==================== 全局配置 ====================
-readonly SCRIPT_VERSION="2.2.0"
+readonly SCRIPT_VERSION="2.3.0"
 readonly SCRIPT_NAME="cf-vps-monitor"
 
 # 系统检测
@@ -57,7 +56,6 @@ command_exists() {
 
 # ==================== 一键安装函数 ====================
 
-# 一键安装主函数（直接从命令行参数执行）
 one_click_install() {
     local server_id=""
     local api_key=""
@@ -115,7 +113,7 @@ one_click_install() {
     install_deps
     
     # 创建服务脚本
-    create_service_script
+    create_service_script_fixed
     
     # 启动服务
     if start_service; then
@@ -337,14 +335,14 @@ install_deps_macos() {
 
 # ==================== 服务脚本创建函数 ====================
 
-create_service_script() {
-    print_msg "$BLUE" "创建服务脚本..."
+create_service_script_fixed() {
+    print_msg "$BLUE" "创建服务脚本(修复版)..."
     
     cat > "$SERVICE_FILE" << 'EOF'
 #!/bin/sh
 
-# VPS监控服务脚本
-# 兼容FreeBSD
+# VPS监控服务脚本 - 修复版
+# 兼容FreeBSD，修复数据上报格式
 
 set -e
 
@@ -377,68 +375,100 @@ load_config() {
     fi
 }
 
-# 获取CPU使用率 (FreeBSD兼容)
+# 获取系统信息函数
+# CPU使用率
 get_cpu_usage() {
-    local usage=0
+    local cpu_usage=0
     if [ -f /proc/stat ]; then
         # Linux系统
         local cpu_line=$(head -n1 /proc/stat)
+        local user=$(echo "$cpu_line" | awk '{print $2}')
+        local nice=$(echo "$cpu_line" | awk '{print $3}')
+        local system=$(echo "$cpu_line" | awk '{print $4}')
         local idle=$(echo "$cpu_line" | awk '{print $5}')
-        local total=0
-        for i in $(seq 2 9); do
-            local val=$(echo "$cpu_line" | awk -v i="$i" '{print $i}')
-            total=$((total + val))
-        done
+        local iowait=$(echo "$cpu_line" | awk '{print $6}')
+        local irq=$(echo "$cpu_line" | awk '{print $7}')
+        local softirq=$(echo "$cpu_line" | awk '{print $8}')
+        local steal=$(echo "$cpu_line" | awk '{print $9}')
+        
+        local total=$((user + nice + system + idle + iowait + irq + softirq + steal))
         if [ $total -gt 0 ]; then
-            usage=$((100 - (idle * 100 / total)))
+            cpu_usage=$((100 - (idle * 100 / total)))
         fi
     elif command_exists sysctl; then
         # FreeBSD系统
         local cpu_times=$(sysctl -n kern.cp_time 2>/dev/null || echo "0 0 0 0 0")
+        local user=$(echo "$cpu_times" | awk '{print $1}')
+        local nice=$(echo "$cpu_times" | awk '{print $2}')
+        local system=$(echo "$cpu_times" | awk '{print $3}')
+        local interrupt=$(echo "$cpu_times" | awk '{print $4}')
         local idle=$(echo "$cpu_times" | awk '{print $5}')
-        local total=0
-        for i in 1 2 3 4 5; do
-            local val=$(echo "$cpu_times" | awk -v i="$i" '{print $i}')
-            total=$((total + val))
-        done
+        
+        local total=$((user + nice + system + interrupt + idle))
         if [ $total -gt 0 ]; then
-            usage=$((100 - (idle * 100 / total)))
+            cpu_usage=$((100 - (idle * 100 / total)))
         fi
     fi
-    echo "$usage"
+    
+    # 确保值在合理范围内
+    if [ $cpu_usage -lt 0 ]; then
+        cpu_usage=0
+    elif [ $cpu_usage -gt 100 ]; then
+        cpu_usage=100
+    fi
+    
+    echo "$cpu_usage"
 }
 
-# 获取内存使用率 (FreeBSD兼容)
+# 内存使用率
 get_memory_usage() {
-    local usage=0
+    local mem_usage=0
     if [ -f /proc/meminfo ]; then
         # Linux系统
         local total=$(grep "^MemTotal:" /proc/meminfo | awk '{print $2}')
         local free=$(grep "^MemFree:" /proc/meminfo | awk '{print $2}')
+        local buffers=$(grep "^Buffers:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
+        local cached=$(grep "^Cached:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
+        
         if [ -n "$total" ] && [ "$total" -gt 0 ]; then
-            usage=$((100 - (free * 100 / total)))
+            local used=$((total - free - buffers - cached))
+            mem_usage=$((used * 100 / total))
         fi
     elif command_exists sysctl; then
         # FreeBSD系统
         local page_size=$(sysctl -n hw.pagesize 2>/dev/null || echo 4096)
         local total_pages=$(sysctl -n vm.stats.vm.v_page_count 2>/dev/null || echo 0)
         local free_pages=$(sysctl -n vm.stats.vm.v_free_count 2>/dev/null || echo 0)
+        local inactive_pages=$(sysctl -n vm.stats.vm.v_inactive_count 2>/dev/null || echo 0)
+        local cache_pages=$(sysctl -n vm.stats.vm.v_cache_count 2>/dev/null || echo 0)
+        
         local total=$((total_pages * page_size / 1024))
-        local free=$((free_pages * page_size / 1024))
+        local free=$(((free_pages + inactive_pages + cache_pages) * page_size / 1024))
+        local used=$((total - free))
+        
         if [ $total -gt 0 ]; then
-            usage=$((100 - (free * 100 / total)))
+            mem_usage=$((used * 100 / total))
         fi
     fi
-    echo "$usage"
+    
+    # 确保值在合理范围内
+    if [ $mem_usage -lt 0 ]; then
+        mem_usage=0
+    elif [ $mem_usage -gt 100 ]; then
+        mem_usage=100
+    fi
+    
+    echo "$mem_usage"
 }
 
-# 获取磁盘使用率
+# 磁盘使用率
 get_disk_usage() {
-    local usage=0
+    local disk_usage=0
     if command_exists df; then
-        usage=$(df -h / | tail -1 | awk '{print $5}' | sed 's/%//' 2>/dev/null || echo 0)
+        disk_usage=$(df -h / 2>/dev/null | tail -1 | awk '{print $5}' | sed 's/%//' 2>/dev/null || echo 0)
     fi
-    echo "$usage"
+    
+    echo "$disk_usage"
 }
 
 # 获取运行时间
@@ -453,45 +483,125 @@ get_uptime() {
             uptime=$((current_time - boot_time))
         fi
     fi
+    
     echo "$uptime"
 }
 
-# 构建监控数据
+# 获取负载平均值
+get_load_avg() {
+    local load1=0 load5=0 load15=0
+    
+    if [ -f /proc/loadavg ]; then
+        load1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)
+        load5=$(awk '{print $2}' /proc/loadavg 2>/dev/null || echo 0)
+        load15=$(awk '{print $3}' /proc/loadavg 2>/dev/null || echo 0)
+    elif command_exists sysctl && [ "$(uname -s)" = "FreeBSD" ]; then
+        local load_avg=$(sysctl -n vm.loadavg 2>/dev/null || echo "0 0 0 0")
+        load1=$(echo "$load_avg" | awk '{print $2}')
+        load5=$(echo "$load_avg" | awk '{print $3}')
+        load15=$(echo "$load_avg" | awk '{print $4}')
+    fi
+    
+    echo "$load1 $load5 $load15"
+}
+
+# 构建监控数据 - 修复版，匹配常见面板格式
 build_monitor_data() {
     local timestamp=$(date +%s)
     local cpu_usage=$(get_cpu_usage)
     local memory_usage=$(get_memory_usage)
     local disk_usage=$(get_disk_usage)
     local uptime=$(get_uptime)
+    local load_avg=$(get_load_avg)
+    local load1=$(echo "$load_avg" | awk '{print $1}')
+    local load5=$(echo "$load_avg" | awk '{print $2}')
+    local load15=$(echo "$load_avg" | awk '{print $3}')
     
+    # 构建JSON数据 - 根据常见面板格式
     cat << JSON
 {
+    "server_id": "$SERVER_ID",
     "timestamp": $timestamp,
-    "cpu_usage": $cpu_usage,
-    "memory_usage": $memory_usage,
-    "disk_usage": $disk_usage,
-    "uptime": $uptime,
-    "server_id": "$SERVER_ID"
+    "cpu": {
+        "usage": $cpu_usage,
+        "load": [$load1, $load5, $load15]
+    },
+    "memory": {
+        "usage": $memory_usage
+    },
+    "disk": {
+        "usage": $disk_usage
+    },
+    "uptime": $uptime
 }
 JSON
 }
 
-# 上报数据
+# 上报数据 - 修复版
 report_data() {
     local data=$(build_monitor_data)
+    local retries=3
+    local delay=2
     
-    local response=$(curl -s -w "%{http_code}" -X POST "$WORKER_URL/api/report/$SERVER_ID" \
-        -H "Content-Type: application/json" \
-        -H "X-API-Key: $API_KEY" \
-        -d "$data" 2>/dev/null || echo "000")
+    log "构建数据: $data"
     
-    local http_code=$(echo "$response" | tail -c 4)
+    for i in $(seq 1 $retries); do
+        log "尝试上报数据 (第 $i 次)..."
+        
+        # 使用curl上报数据
+        local response
+        response=$(curl -s -w "\n%{http_code}" \
+            -X POST "$WORKER_URL/api/report/$SERVER_ID" \
+            -H "Content-Type: application/json" \
+            -H "X-API-Key: $API_KEY" \
+            -d "$data" 2>/dev/null || echo "000")
+        
+        local http_code=$(echo "$response" | tail -1)
+        local response_body=$(echo "$response" | sed '$d')
+        
+        log "HTTP响应码: $http_code"
+        if [ -n "$response_body" ]; then
+            log "响应内容: $response_body"
+        fi
+        
+        if [ "$http_code" = "200" ]; then
+            log "数据上报成功"
+            return 0
+        elif [ "$http_code" = "401" ]; then
+            log "认证失败，请检查API密钥"
+            return 1
+        elif [ "$http_code" = "404" ]; then
+            log "服务器ID不存在"
+            return 1
+        else
+            log "数据上报失败 (HTTP $http_code)"
+            if [ $i -lt $retries ]; then
+                log "等待 ${delay} 秒后重试..."
+                sleep $delay
+            fi
+        fi
+    done
+    
+    log "数据上报最终失败"
+    return 1
+}
+
+# 测试连接
+test_connection() {
+    log "测试服务器连接..."
+    
+    local response
+    response=$(curl -s -w "\n%{http_code}" \
+        -X GET "$WORKER_URL/api/test" \
+        -H "X-API-Key: $API_KEY" 2>/dev/null || echo "000")
+    
+    local http_code=$(echo "$response" | tail -1)
     
     if [ "$http_code" = "200" ]; then
-        log "数据上报成功"
+        log "服务器连接测试成功"
         return 0
     else
-        log "数据上报失败 (HTTP $http_code)"
+        log "服务器连接测试失败 (HTTP $http_code)"
         return 1
     fi
 }
@@ -507,11 +617,28 @@ main() {
     # 加载配置
     load_config
     
+    # 测试连接
+    if test_connection; then
+        log "服务器连接正常，开始上报数据"
+    else
+        log "服务器连接失败，但将继续尝试上报"
+    fi
+    
+    local fail_count=0
+    local max_fail_count=5
+    
     while true; do
         if report_data; then
             log "上报成功，等待 ${INTERVAL} 秒..."
+            fail_count=0
         else
             log "上报失败，等待 ${INTERVAL} 秒后重试..."
+            fail_count=$((fail_count + 1))
+            
+            if [ $fail_count -ge $max_fail_count ]; then
+                log "连续失败次数过多，重启服务..."
+                exec "$0"
+            fi
         fi
         
         sleep "$INTERVAL"
@@ -522,13 +649,13 @@ main() {
 main
 EOF
     
-    # 替换脚本目录路径 - 使用sed的兼容方法
+    # 替换脚本目录路径
     local temp_file="$SERVICE_FILE.tmp"
     sed "s|__SCRIPT_DIR__|$SCRIPT_DIR|g" "$SERVICE_FILE" > "$temp_file"
     mv "$temp_file" "$SERVICE_FILE"
     
     chmod +x "$SERVICE_FILE"
-    print_msg "$GREEN" "✓ 服务脚本创建完成"
+    print_msg "$GREEN" "✓ 服务脚本创建完成(修复版)"
 }
 
 # ==================== 服务管理函数 ====================
@@ -590,151 +717,31 @@ start_service() {
     if kill -0 "$pid" 2>/dev/null; then
         print_msg "$GREEN" "✓ 监控服务已启动 (PID: $pid)"
         
-        # 配置自启动
-        setup_autostart
+        # 等待几秒后检查日志，确认数据上报
+        sleep 3
+        if [ -f "$LOG_FILE" ]; then
+            local last_log=$(tail -5 "$LOG_FILE" 2>/dev/null | grep -i "上报\|成功\|失败" | tail -1 || true)
+            if [ -n "$last_log" ]; then
+                print_msg "$CYAN" "最近日志: $last_log"
+            fi
+        fi
         
         return 0
     else
         print_msg "$RED" "✗ 监控服务启动失败"
         if [ -f "$LOG_FILE" ]; then
             print_msg "$YELLOW" "查看日志: tail -f $LOG_FILE"
+            print_msg "$CYAN" "最近日志:"
+            tail -10 "$LOG_FILE" 2>/dev/null | sed 's/^/  /' || true
         fi
         rm -f "$PID_FILE" 2>/dev/null
         return 1
     fi
 }
 
-# 配置自启动
-setup_autostart() {
-    print_msg "$BLUE" "配置自启动..."
-    
-    # FreeBSD使用rc.d
-    if [[ "$OS" == "FreeBSD" ]]; then
-        setup_rc_daemon
-    elif command_exists systemctl; then
-        setup_systemd_service
-    elif command_exists crontab; then
-        setup_crontab_autostart
-    else
-        print_msg "$YELLOW" "⚠ 自启动配置失败，服务需要手动启动"
-    fi
-}
-
-# FreeBSD rc.d配置
-setup_rc_daemon() {
-    print_msg "$CYAN" "设置FreeBSD rc.d服务..."
-    
-    # 普通用户无法设置系统服务，使用crontab
-    if [ $EUID -ne 0 ]; then
-        print_msg "$YELLOW" "需要root权限设置rc.d服务，使用crontab替代"
-        setup_crontab_autostart
-        return
-    fi
-    
-    local rc_file="/usr/local/etc/rc.d/cf-vps-monitor"
-    
-    cat > "$rc_file" << 'RCFILE'
-#!/bin/sh
-
-# PROVIDE: cf_vps_monitor
-# REQUIRE: NETWORKING
-# KEYWORD: shutdown
-
-. /etc/rc.subr
-
-name="cf_vps_monitor"
-rcvar="${name}_enable"
-pidfile="/var/run/cf-vps-monitor.pid"
-command="/usr/sbin/daemon"
-command_args="-P ${pidfile} -r -f __SERVICE_SCRIPT__"
-
-load_rc_config $name
-run_rc_command "$1"
-RCFILE
-    
-    # 替换服务脚本路径
-    local temp_file="$rc_file.tmp"
-    sed "s|__SERVICE_SCRIPT__|$SERVICE_FILE|g" "$rc_file" > "$temp_file"
-    mv "$temp_file" "$rc_file"
-    
-    chmod +x "$rc_file"
-    
-    # 启用服务
-    sysrc cf_vps_monitor_enable="YES" 2>/dev/null || true
-    print_msg "$GREEN" "✓ FreeBSD rc.d服务已配置"
-}
-
-# 配置systemd服务
-setup_systemd_service() {
-    local service_file=""
-    
-    if [ $EUID -eq 0 ]; then
-        service_file="/etc/systemd/system/cf-vps-monitor.service"
-    else
-        service_file="$HOME/.config/systemd/user/cf-vps-monitor.service"
-        mkdir -p "$(dirname "$service_file")"
-    fi
-    
-    cat > "$service_file" << EOF
-[Unit]
-Description=CF VPS监控服务
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=$SERVICE_FILE
-Restart=always
-RestartSec=10
-WorkingDirectory=$SCRIPT_DIR
-
-[Install]
-WantedBy=default.target
-EOF
-    
-    if [ $EUID -eq 0 ]; then
-        systemctl daemon-reload 2>/dev/null || true
-        systemctl enable cf-vps-monitor.service 2>/dev/null || true
-    else
-        systemctl --user daemon-reload 2>/dev/null || true
-        systemctl --user enable cf-vps-monitor.service 2>/dev/null || true
-    fi
-    
-    print_msg "$GREEN" "✓ systemd服务已配置"
-}
-
-# 配置crontab自启动
-setup_crontab_autostart() {
-    if ! command_exists crontab; then
-        return 1
-    fi
-    
-    local crontab_entry="@reboot sleep 30 && $SERVICE_FILE"
-    (crontab -l 2>/dev/null | grep -v "$SERVICE_FILE"; echo "$crontab_entry") | crontab -
-    
-    print_msg "$GREEN" "✓ crontab自启动已配置"
-}
-
 # 停止服务
 stop_service() {
     print_msg "$BLUE" "停止监控服务..."
-    
-    # 停止FreeBSD rc.d服务
-    if [[ "$OS" == "FreeBSD" ]] && [ $EUID -eq 0 ]; then
-        service cf_vps_monitor stop 2>/dev/null || true
-        sysrc -x cf_vps_monitor_enable 2>/dev/null || true
-        rm -f /usr/local/etc/rc.d/cf-vps-monitor 2>/dev/null || true
-    fi
-    
-    # 停止systemd服务
-    if command_exists systemctl; then
-        if [ $EUID -eq 0 ]; then
-            systemctl stop cf-vps-monitor.service 2>/dev/null || true
-            systemctl disable cf-vps-monitor.service 2>/dev/null || true
-        else
-            systemctl --user stop cf-vps-monitor.service 2>/dev/null || true
-            systemctl --user disable cf-vps-monitor.service 2>/dev/null || true
-        fi
-    fi
     
     # 停止进程
     if [ -f "$PID_FILE" ]; then
@@ -744,11 +751,6 @@ stop_service() {
             sleep 1
             kill -9 "$pid" 2>/dev/null || true
         fi
-    fi
-    
-    # 清理crontab
-    if command_exists crontab; then
-        (crontab -l 2>/dev/null | grep -v "$SERVICE_FILE") | crontab - 2>/dev/null || true
     fi
     
     # 清理文件
@@ -817,9 +819,25 @@ check_service_status() {
         [ -n "$log_size" ] && echo "  大小: $log_size"
         echo "  行数: $log_lines"
         
-        # 显示最后3行日志
+        # 显示最后5行日志
         echo "  最后日志:"
-        tail -n 3 "$LOG_FILE" 2>/dev/null | sed 's/^/    /' || true
+        tail -5 "$LOG_FILE" 2>/dev/null | sed 's/^/    /' || true
+        
+        # 检查最近是否有上报成功
+        echo
+        print_msg "$BLUE" "最近上报状态:"
+        local last_success=$(grep -i "上报成功" "$LOG_FILE" | tail -1 2>/dev/null || true)
+        local last_fail=$(grep -i "上报失败\|失败 (HTTP" "$LOG_FILE" | tail -1 2>/dev/null || true)
+        
+        if [ -n "$last_success" ]; then
+            print_msg "$GREEN" "  最近成功: $last_success"
+        fi
+        if [ -n "$last_fail" ]; then
+            print_msg "$RED" "  最近失败: $last_fail"
+        fi
+        if [ -z "$last_success" ] && [ -z "$last_fail" ]; then
+            print_msg "$YELLOW" "  暂无上报记录"
+        fi
     else
         print_msg "$YELLOW" "✗ 日志文件不存在"
     fi
@@ -869,6 +887,48 @@ uninstall_service() {
     fi
 }
 
+# ==================== 测试连接函数 ====================
+
+test_connection_manual() {
+    print_msg "$BLUE" "测试服务器连接..."
+    
+    if [ ! -f "$CONFIG_FILE" ]; then
+        print_msg "$RED" "配置文件不存在，请先安装"
+        return 1
+    fi
+    
+    # 加载配置
+    . "$CONFIG_FILE"
+    
+    print_msg "$CYAN" "使用配置:"
+    echo "  Worker URL: $WORKER_URL"
+    echo "  Server ID: $SERVER_ID"
+    echo "  API Key: ${API_KEY:0:8}..."
+    echo
+    
+    local response
+    response=$(curl -s -w "\n%{http_code}" \
+        -X GET "$WORKER_URL/api/test" \
+        -H "X-API-Key: $API_KEY" 2>/dev/null || echo "000")
+    
+    local http_code=$(echo "$response" | tail -1)
+    local response_body=$(echo "$response" | sed '$d')
+    
+    if [ "$http_code" = "200" ]; then
+        print_msg "$GREEN" "✓ 服务器连接测试成功"
+        if [ -n "$response_body" ]; then
+            print_msg "$CYAN" "响应: $response_body"
+        fi
+        return 0
+    else
+        print_msg "$RED" "✗ 服务器连接测试失败 (HTTP $http_code)"
+        if [ -n "$response_body" ]; then
+            print_msg "$CYAN" "响应: $response_body"
+        fi
+        return 1
+    fi
+}
+
 # ==================== 帮助信息 ====================
 
 show_help() {
@@ -884,6 +944,7 @@ VPS监控脚本 v$SCRIPT_VERSION
   restart        重启监控服务
   status         查看服务状态
   logs           查看服务日志
+  test           测试服务器连接
   uninstall      卸载监控服务
   help           显示帮助信息
 
@@ -903,11 +964,15 @@ VPS监控脚本 v$SCRIPT_VERSION
   
   # 查看日志
   ./cf-vps-monitor.sh logs
+  
+  # 测试连接
+  ./cf-vps-monitor.sh test
 
 注意:
   - 脚本自动检测系统并安装依赖
   - 服务会在系统重启后自动启动
   - 默认上报间隔为10秒
+  - 数据上报格式已修复，支持常见监控面板
 EOF
 }
 
@@ -927,7 +992,7 @@ main() {
     local command=""
     for arg in "$@"; do
         case "$arg" in
-            start|stop|restart|status|logs|uninstall|help)
+            start|stop|restart|status|logs|test|uninstall|help)
                 command="$arg"
                 break
                 ;;
@@ -956,6 +1021,9 @@ main() {
             ;;
         logs)
             view_logs
+            ;;
+        test)
+            test_connection_manual
             ;;
         uninstall)
             uninstall_service
