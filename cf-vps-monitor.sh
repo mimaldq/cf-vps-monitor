@@ -1,13 +1,12 @@
 #!/bin/bash
 
 # cf-vps-monitor - Cloudflare Worker VPS监控脚本
-# 版本: 2.1.0 (FreeBSD优化版)
-# 完全兼容FreeBSD系统
+# 版本: 2.2.0 (问题修复版)
 
 set -euo pipefail
 
 # ==================== 全局配置 ====================
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.2.0"
 readonly SCRIPT_NAME="cf-vps-monitor"
 
 # 系统检测
@@ -28,9 +27,6 @@ readonly CONFIG_FILE="$SCRIPT_DIR/config/config"
 readonly LOG_FILE="$SCRIPT_DIR/logs/monitor.log"
 readonly PID_FILE="$SCRIPT_DIR/run/monitor.pid"
 readonly SERVICE_FILE="$SCRIPT_DIR/bin/vps-monitor-service.sh"
-
-# 全局标志
-ONE_CLICK_INSTALL=false
 
 # ==================== 工具函数 ====================
 
@@ -70,18 +66,20 @@ safe_sed() {
     fi
 }
 
-# ==================== 一键安装函数 ====================
+# ==================== 主入口点 ====================
 
 # 解析命令行参数
 parse_args() {
+    local command=""
     local server_id=""
     local api_key=""
     local worker_url=""
+    local install_mode=false
     
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -i|--install)
-                ONE_CLICK_INSTALL=true
+                install_mode=true
                 shift
                 ;;
             -s|--server-id)
@@ -101,27 +99,28 @@ parse_args() {
                 exit 0
                 ;;
             *)
-                # 返回剩余参数
-                echo "$1"
+                command="$1"
                 shift
+                break
                 ;;
         esac
     done
     
-    # 如果是一键安装模式，立即执行并退出
-    if [[ "$ONE_CLICK_INSTALL" == "true" ]]; then
+    # 如果是一键安装模式
+    if [[ "$install_mode" == "true" ]]; then
         if [[ -z "$server_id" || -z "$api_key" || -z "$worker_url" ]]; then
             error_exit "一键安装需要所有参数: -s SERVER_ID -k API_KEY -u WORKER_URL"
         fi
         one_click_install "$server_id" "$api_key" "$worker_url"
-        # 这里会退出脚本，不会返回
+        exit $?  # 安装完成后退出
     fi
     
-    # 如果没有命令，返回空字符串
-    [[ $# -eq 0 ]] && echo ""
+    # 返回命令
+    echo "$command"
 }
 
-# 一键安装主函数
+# ==================== 一键安装函数 ====================
+
 one_click_install() {
     local server_id="$1"
     local api_key="$2"
@@ -172,9 +171,9 @@ one_click_install() {
         echo "  重启服务: $0 restart"
         echo
         print_msg "$GREEN" "✓ 监控服务已启动并开始上报数据"
-        exit 0  # 安装完成，退出脚本
+        return 0
     else
-        error_exit "服务启动失败"
+        return 1
     fi
 }
 
@@ -561,15 +560,10 @@ main() {
 main
 EOF
     
-    # 替换脚本目录路径 - 使用FreeBSD兼容的方法
+    # 替换脚本目录路径
     if [[ "$OS" == "FreeBSD" ]] || [[ "$OS" == "Darwin" ]]; then
         # FreeBSD/MacOS使用不同的sed语法
-        sed -i '' "s|__SCRIPT_DIR__|$SCRIPT_DIR|g" "$SERVICE_FILE" 2>/dev/null || {
-            print_msg "$YELLOW" "sed替换失败，尝试使用临时文件..."
-            local temp_file="$SERVICE_FILE.tmp"
-            sed "s|__SCRIPT_DIR__|$SCRIPT_DIR|g" "$SERVICE_FILE" > "$temp_file"
-            mv "$temp_file" "$SERVICE_FILE"
-        }
+        sed -i '' "s|__SCRIPT_DIR__|$SCRIPT_DIR|g" "$SERVICE_FILE" 2>/dev/null
     else
         sed -i "s|__SCRIPT_DIR__|$SCRIPT_DIR|g" "$SERVICE_FILE"
     fi
@@ -963,14 +957,15 @@ EOF
 # ==================== 主函数 ====================
 
 main() {
-    # 解析参数
+    # 如果没有参数，显示帮助
+    if [ $# -eq 0 ]; then
+        show_help
+        exit 0
+    fi
+    
+    # 解析参数并获取命令
     local command
     command=$(parse_args "$@")
-    
-    # 如果是一键安装模式，已经处理并退出
-    if [[ "$ONE_CLICK_INSTALL" == "true" ]]; then
-        return  # 这里不应该执行到，因为one_click_install已经退出
-    fi
     
     # 处理命令
     case "$command" in
