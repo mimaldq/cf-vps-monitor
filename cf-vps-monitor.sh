@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # cf-vps-monitor - Cloudflare Worker VPS监控脚本
-# 版本: 2.1.0
+# 版本: 1.1.0
 # 支持所有常见Linux系统，无需root权限
 
 set -euo pipefail
@@ -942,14 +942,53 @@ get_cpu_usage() {
     echo "{\"usage_percent\":$cpu_usage,\"load_avg\":[$cpu_load]}"
 }
 
-# 获取内存使用情况（优化版）
+# 获取内存使用情况（优化版，特别针对容器环境）
 get_memory_usage() {
-    local total used free usage_percent
+    local total=0 used=0 free=0 usage_percent=0
+    local container_memory_limit=0 container_memory_usage=0
+
+    # 首先尝试检测是否是容器环境并获取容器内存限制
+    local is_container=false
+    
+    # 检测容器环境（多种方法）
+    if [[ -f /.dockerenv ]] || \
+       [[ -f /proc/1/cgroup ]] && grep -q "docker\|kubepods\|containerd" /proc/1/cgroup 2>/dev/null; then
+        is_container=true
+        log "检测到容器环境，使用cgroup内存限制"
+    fi
+
+    # 检测Cgroup V2 (现代Linux系统)
+    local cgroup_v2_limit=0 cgroup_v2_usage=0 cgroup_v2_found=false
+    if [[ -f /sys/fs/cgroup/memory.max ]]; then
+        local max_raw=$(cat /sys/fs/cgroup/memory.max 2>/dev/null | tr -d '\n')
+        if [[ "$max_raw" != "max" && "$max_raw" =~ ^[0-9]+$ ]]; then
+            cgroup_v2_limit="$max_raw"
+            if [[ -f /sys/fs/cgroup/memory.current ]]; then
+                cgroup_v2_usage=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo "0")
+                cgroup_v2_found=true
+                log "检测到Cgroup V2内存限制: $((cgroup_v2_limit / 1024 / 1024))MB"
+            fi
+        fi
+    fi
+
+    # 检测Cgroup V1 (旧版Linux系统)
+    local cgroup_v1_limit=0 cgroup_v1_usage=0 cgroup_v1_found=false
+    if [[ "$cgroup_v2_found" == "false" && -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
+        local limit_raw=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo "0")
+        # 排除极大值（通常是未限制的情况，如9223372036854771712）
+        if [[ "$limit_raw" =~ ^[0-9]+$ ]] && \
+           [[ "$limit_raw" -lt 9223372036854771712 ]] && \
+           [[ "$limit_raw" -gt 0 ]]; then
+            cgroup_v1_limit="$limit_raw"
+            cgroup_v1_usage=$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null || echo "0")
+            cgroup_v1_found=true
+            log "检测到Cgroup V1内存限制: $((cgroup_v1_limit / 1024 / 1024))MB"
+        fi
+    fi
 
     # FreeBSD系统
     if [[ "$OS" == "FreeBSD" ]]; then
         if command_exists sysctl; then
-            # FreeBSD内存信息
             local page_size=$(sysctl -n hw.pagesize 2>/dev/null || echo "4096")
             local total_pages=$(sysctl -n vm.stats.vm.v_page_count 2>/dev/null || echo "0")
             local free_pages=$(sysctl -n vm.stats.vm.v_free_count 2>/dev/null || echo "0")
@@ -987,23 +1026,35 @@ get_memory_usage() {
             free=0
         fi
     else
-        # Linux系统 - 优化内存计算逻辑
-        total=0
-        used=0
-        free=0
+        # Linux系统 - 优先级：容器内存限制 > 物理内存
+        local cgroup_limit=0 cgroup_usage=0 cgroup_found=false
+        
+        # 优先使用检测到的cgroup限制
+        if [[ "$cgroup_v2_found" == "true" ]]; then
+            cgroup_limit="$cgroup_v2_limit"
+            cgroup_usage="$cgroup_v2_usage"
+            cgroup_found=true
+        elif [[ "$cgroup_v1_found" == "true" ]]; then
+            cgroup_limit="$cgroup_v1_limit"
+            cgroup_usage="$cgroup_v1_usage"
+            cgroup_found=true
+        fi
 
+        # 获取物理内存信息
+        local physical_total=0 physical_used=0 physical_free=0
+        
         # 方法1: 使用free命令（最常用且最准确）
         if command_exists free; then
             local mem_info=$(free -k 2>/dev/null | grep "^Mem:")
             if [[ -n "$mem_info" ]]; then
-                total=$(echo "$mem_info" | awk '{print $2}')
+                physical_total=$(echo "$mem_info" | awk '{print $2}')
 
                 # 尝试获取available列（第7列，现代Linux系统）
                 local available=$(echo "$mem_info" | awk '{print $7}' 2>/dev/null || echo "")
                 if [[ "$available" =~ ^[0-9]+$ ]]; then
                     # 如果有available列，使用它作为真正的可用内存
-                    free=$available
-                    used=$((total - free))
+                    physical_free="$available"
+                    physical_used=$((physical_total - physical_free))
                 else
                     # 如果没有available列，使用传统方法计算
                     local mem_free=$(echo "$mem_info" | awk '{print $4}' 2>/dev/null || echo "0")
@@ -1011,14 +1062,14 @@ get_memory_usage() {
 
                     # 验证数据有效性
                     if [[ "$mem_free" =~ ^[0-9]+$ ]] && [[ "$buff_cache" =~ ^[0-9]+$ ]]; then
-                        free=$((mem_free + buff_cache))
-                        used=$((total - free))
+                        physical_free=$((mem_free + buff_cache))
+                        physical_used=$((physical_total - physical_free))
                     else
                         # 如果解析失败，使用第3列作为used，但需要重新计算free
                         local raw_used=$(echo "$mem_info" | awk '{print $3}' 2>/dev/null || echo "0")
                         if [[ "$raw_used" =~ ^[0-9]+$ ]]; then
-                            used=$raw_used
-                            free=$((total - used))
+                            physical_used="$raw_used"
+                            physical_free=$((physical_total - physical_used))
                         fi
                     fi
                 fi
@@ -1026,67 +1077,50 @@ get_memory_usage() {
         fi
 
         # 方法2: 直接读取/proc/meminfo（备用方法）
-        if [[ "$total" == "0" ]] && [[ -f /proc/meminfo ]]; then
-            total=$(grep "^MemTotal:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
+        if [[ "$physical_total" == "0" ]] && [[ -f /proc/meminfo ]]; then
+            physical_total=$(grep "^MemTotal:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
             local mem_free=$(grep "^MemFree:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
             local buffers=$(grep "^Buffers:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
             local cached=$(grep "^Cached:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
             local sreclaimable=$(grep "^SReclaimable:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
 
             # 计算实际可用内存（包括可回收的内存）
-            free=$((mem_free + buffers + cached + sreclaimable))
-            used=$((total - free))
+            physical_free=$((mem_free + buffers + cached + sreclaimable))
+            physical_used=$((physical_total - physical_free))
         fi
 
-        # 方法3: 容器环境特殊处理 (Cgroup V1 & V2)
-        # 即使没有CONTAINER_ENV变量，如果检测到cgroup限制且限制合理，也优先使用
-        local cgroup_limit="0"
-        local cgroup_usage="0"
-        local cgroup_found=false
-        
-        # 尝试检测 Cgroup V2
-        if [[ -f /sys/fs/cgroup/memory.max ]]; then
-            local max_raw=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
-            if [[ "$max_raw" != "max" && "$max_raw" =~ ^[0-9]+$ ]]; then
-                cgroup_limit="$max_raw"
-                if [[ -f /sys/fs/cgroup/memory.current ]]; then
-                    cgroup_usage=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo "0")
-                    cgroup_found=true
-                fi
-            fi
-        fi
-        
-        # 尝试检测 Cgroup V1 (如果V2没找到)
-        if [[ "$cgroup_found" == "false" && -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
-            local limit_raw=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo "0")
-            # 忽略极大的值 (未限制)
-            if [[ "$limit_raw" =~ ^[0-9]+$ && "$limit_raw" -lt 9223372036854771712 ]]; then
-                cgroup_limit="$limit_raw"
-                cgroup_usage=$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null || echo "0")
-                cgroup_found=true
-            fi
-        fi
-        
-        # 如果找到了有效的cgroup限制，并且限制值小于宿主机物理内存(total)，则使用cgroup数据
-        # 或者如果total是0（上面获取失败），直接使用cgroup数据
+        # 确定最终使用的内存数据
         if [[ "$cgroup_found" == "true" ]]; then
-            local cgroup_total_kb=$((cgroup_limit / 1024))
+            # 容器环境：使用cgroup限制
+            total=$((cgroup_limit / 1024))
+            used=$((cgroup_usage / 1024))
+            free=$((total - used))
             
-            # 只有当cgroup限制明显即使有效（例如小于宿主机内存，或者我们确定是在容器里）时才使用
-            # 这里如果不确定宿主机内存，或者cgroup限制小于宿主机内存，就采用
-            if [[ "$total" == "0" || "$cgroup_total_kb" -lt "$total" ]]; then
-                total=$cgroup_total_kb
-                used=$((cgroup_usage / 1024))
-                free=$((total - used))
+            # 验证数据合理性
+            if [[ $used -lt 0 ]]; then
+                used=0
+                free=$total
             fi
+            if [[ $free -lt 0 ]]; then
+                free=0
+                used=$total
+            fi
+            
+            # 如果cgroup限制明显大于物理内存，可能是错误，回退到物理内存
+            if [[ $total -gt $((physical_total * 2)) ]] && [[ $physical_total -gt 0 ]]; then
+                log "警告: cgroup限制(${total}KB)远大于物理内存(${physical_total}KB)，使用物理内存数据"
+                total="$physical_total"
+                used="$physical_used"
+                free="$physical_free"
+            fi
+        else
+            # 非容器环境：使用物理内存
+            total="$physical_total"
+            used="$physical_used"
+            free="$physical_free"
         fi
 
-        # 确保所有值都是有效数字
-        total=$(sanitize_integer "$total" "0")
-        used=$(sanitize_integer "$used" "0")
-        free=$(sanitize_integer "$free" "0")
-
-        # 数据一致性验证和修正 - 优化版本
+        # 数据一致性验证和修正
         if [[ $total -gt 0 ]]; then
             # 确保所有值都是有效数字
             total=$(sanitize_integer "$total" "0")
@@ -1104,7 +1138,9 @@ get_memory_usage() {
             fi
 
             if [[ ${diff#-} -gt $tolerance ]]; then
-                # 数据不一致，优先保证total的准确性
+                log "警告: 内存数据不一致 (total: ${total}, used: ${used}, free: ${free}, diff: ${diff})"
+                
+                # 重新计算，优先保证total的准确性
                 if [[ $free -gt $total ]]; then
                     # free过大，重置为total
                     free=$total
@@ -1127,6 +1163,8 @@ get_memory_usage() {
                     free=0
                     used=$total
                 fi
+                
+                log "修正后: total: ${total}, used: ${used}, free: ${free}"
             fi
         else
             # 如果没有获取到数据，设置默认值
@@ -1147,7 +1185,12 @@ get_memory_usage() {
         usage_percent="0"
     fi
 
-    echo "{\"total\":$total,\"used\":$used,\"free\":$free,\"usage_percent\":$usage_percent}"
+    # 记录内存使用信息（调试用）
+    if [[ "${DEBUG_MEMORY:-false}" == "true" ]]; then
+        log "内存统计 - 容器: $is_container, Total: ${total}KB, Used: ${used}KB, Free: ${free}KB, Usage: ${usage_percent}%"
+    fi
+
+    echo "{\"total\":$total,\"used\":$used,\"free\":$free,\"usage_percent\":$usage_percent,\"is_container\":$is_container}"
 }
 
 # 获取磁盘使用情况
@@ -2062,8 +2105,6 @@ EOF
     print_message "$GREEN" "✓ systemd服务创建完成: $service_path"
     return 0
 }
-
-# ==================== systemd lingering支持 ====================
 
 # 简化的lingering启用
 enable_lingering() {
