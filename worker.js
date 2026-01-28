@@ -3944,7 +3944,7 @@ function getIndexHtml() {
                 VPS监控面板
             </a>
             <div class="d-flex align-items-center">
-                <a href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="btn btn-outline-light btn-sm me-2" title="GitHub Repository">
+                <a href="https://github.com/mimaldq/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="btn btn-outline-light btn-sm me-2" title="GitHub Repository">
                     <i class="bi bi-github"></i>
                 </a>
                 <button id="themeToggler" class="btn btn-outline-light btn-sm me-2" title="切换主题">
@@ -4069,7 +4069,7 @@ function getIndexHtml() {
     <footer class="footer fixed-bottom py-2 bg-light border-top">
         <div class="container text-center">
             <span class="text-muted small">VPS监控面板 &copy; 2025</span>
-            <a href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="ms-3 text-muted" title="GitHub Repository">
+            <a href="https://github.com/mimaldq/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="ms-3 text-muted" title="GitHub Repository">
                 <i class="bi bi-github"></i>
             </a>
         </div>
@@ -4350,7 +4350,7 @@ function getLoginHtml() {
     <footer class="footer fixed-bottom py-2 bg-light border-top">
         <div class="container text-center">
             <span class="text-muted small">VPS监控面板 &copy; 2025</span>
-            <a href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="ms-3 text-muted" title="GitHub Repository">
+            <a href="https://github.com/mimaldq/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="ms-3 text-muted" title="GitHub Repository">
                 <i class="bi bi-github"></i>
             </a>
         </div>
@@ -4421,7 +4421,7 @@ function getAdminHtml() {
                 <a class="nav-link text-light me-2" href="/" style="white-space: nowrap;">返回首页</a>
 
                 <!-- PC端直接显示的按钮 -->
-                <a href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="btn btn-outline-light btn-sm me-2 desktop-only" title="GitHub Repository">
+                <a href="https://github.com/mimaldq/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="btn btn-outline-light btn-sm me-2 desktop-only" title="GitHub Repository">
                     <i class="bi bi-github"></i>
                 </a>
 
@@ -4439,7 +4439,7 @@ function getAdminHtml() {
                         <i class="bi bi-three-dots"></i>
                     </button>
                     <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="adminMenuDropdown">
-                        <li><a class="dropdown-item" href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer">
+                        <li><a class="dropdown-item" href="https://github.com/mimaldq/cf-vps-monitor" target="_blank" rel="noopener noreferrer">
                             <i class="bi bi-github me-2"></i>GitHub
                         </a></li>
                         <li><button class="dropdown-item" id="changePasswordBtn">
@@ -4843,7 +4843,7 @@ function getAdminHtml() {
     <footer class="footer fixed-bottom py-2 bg-light border-top">
         <div class="container text-center">
             <span class="text-muted small">VPS监控面板 &copy; 2025</span>
-            <a href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="ms-3 text-muted" title="GitHub Repository">
+            <a href="https://github.com/mimaldq/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="ms-3 text-muted" title="GitHub Repository">
                 <i class="bi bi-github"></i>
             </a>
         </div>
@@ -8543,7 +8543,7 @@ async function copyVpsInstallScript(serverId, serverName, buttonElement) {
         const workerUrl = window.location.origin;
 
         // 使用GitHub上的脚本地址
-        const baseScriptUrl = "https://raw.githubusercontent.com/kadidalax/cf-vps-monitor/main/cf-vps-monitor.sh";
+        const baseScriptUrl = "https://raw.githubusercontent.com/mimaldq/cf-vps-monitor/main/cf-vps-monitor.sh";
         // 生成安装命令（让脚本自动从服务器获取上报间隔）
         const scriptCommand = 'wget ' + baseScriptUrl + ' -O cf-vps-monitor.sh && chmod +x cf-vps-monitor.sh && ./cf-vps-monitor.sh -i -k ' + apiKey + ' -s ' + serverId + ' -u ' + workerUrl;
 
